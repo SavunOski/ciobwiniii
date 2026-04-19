@@ -14,6 +14,7 @@ public partial class Main : Node2D
 	private Texture2D _roadTileTexture;
 	private readonly Dictionary<string, Texture2D> _roadTextures = new();
 	private readonly Dictionary<string, int> _facilityPatientCounts = new();
+	private readonly Dictionary<string, string> _lastPreferredFacility = new();
 
 	private const int GridSize = 20;
 	private const int TileSpacing = 64;
@@ -61,6 +62,7 @@ public partial class Main : Node2D
 
 	private bool _hospitalFundingCutActive = false;
 	private bool _fundingCutUsedThisTurn = false;
+	private bool _budgetLossPending = false;
 
 	private bool _turnInProgress = false;
 	private bool _resolveTurnAfterResponse = false;
@@ -242,8 +244,9 @@ public partial class Main : Node2D
 
 	private string GetFacilityForHouse(string houseId)
 	{
-		// Try to find from last response cached in patient counts (not ideal, but workable)
-		return "unknown";
+		return _lastPreferredFacility.TryGetValue(houseId, out var facilityId)
+			? facilityId
+			: "unknown";
 	}
 
 	private float GetRoadCongestionValue(Vector2I roadPos)
@@ -271,6 +274,158 @@ public partial class Main : Node2D
 	private int GetFacilityPatients(string facilityId)
 	{
 		return _facilityPatientCounts.TryGetValue(facilityId, out var count) ? count : 0;
+	}
+
+	private bool TryGetFacilityGrid(string facilityId, out Vector2I facilityGrid)
+	{
+		facilityGrid = default;
+		if (facilityId == "Clinic")
+		{
+			facilityGrid = _clinicPos;
+			return true;
+		}
+
+		if (!string.IsNullOrEmpty(facilityId) &&
+			facilityId.StartsWith("Hospital_") &&
+			int.TryParse(facilityId.Replace("Hospital_", ""), out int hospitalIdx) &&
+			hospitalIdx >= 0 &&
+			hospitalIdx < _hospitalPositions.Count)
+		{
+			facilityGrid = _hospitalPositions[hospitalIdx];
+			return true;
+		}
+
+		return false;
+	}
+
+	private HashSet<Vector2I> BuildWalkableTiles()
+	{
+		var roadTiles = new HashSet<Vector2I>();
+		foreach (var kv in _structures)
+		{
+			if (kv.Value == BuildTool.Road && !_blockedRoads.Contains(kv.Key))
+				roadTiles.Add(kv.Key);
+		}
+
+		var buildingConnectors = new HashSet<Vector2I>();
+		foreach (var pos in _occupiedTiles)
+		{
+			buildingConnectors.Add(pos);
+			foreach (var next in GetCardinalNeighbors(pos))
+			{
+				if (next.X >= 0 && next.Y >= 0 && next.X < GridSize && next.Y < GridSize)
+					buildingConnectors.Add(next);
+			}
+		}
+
+		var walkable = new HashSet<Vector2I>(roadTiles);
+		foreach (var pos in _occupiedTiles)
+			walkable.Add(pos);
+
+		foreach (var tile in buildingConnectors)
+		{
+			if (walkable.Contains(tile)) continue;
+			foreach (var next in GetCardinalNeighbors(tile))
+			{
+				if (roadTiles.Contains(next))
+				{
+					walkable.Add(tile);
+					break;
+				}
+			}
+		}
+
+		return walkable;
+	}
+
+	private Dictionary<Vector2I, int> ComputeWalkableDistances(Vector2I start, HashSet<Vector2I> walkable)
+	{
+		var distances = new Dictionary<Vector2I, int>();
+		if (!walkable.Contains(start)) return distances;
+
+		var queue = new Queue<Vector2I>();
+		queue.Enqueue(start);
+		distances[start] = 0;
+
+		while (queue.Count > 0)
+		{
+			var pos = queue.Dequeue();
+			int cost = distances[pos];
+			foreach (var next in GetCardinalNeighbors(pos))
+			{
+				if (next.X < 0 || next.Y < 0 || next.X >= GridSize || next.Y >= GridSize) continue;
+				if (!walkable.Contains(next) || distances.ContainsKey(next)) continue;
+				distances[next] = cost + 1;
+				queue.Enqueue(next);
+			}
+		}
+
+		return distances;
+	}
+
+	private IEnumerable<Vector2I> GetCardinalNeighbors(Vector2I pos)
+	{
+		yield return new Vector2I(pos.X, pos.Y - 1);
+		yield return new Vector2I(pos.X + 1, pos.Y);
+		yield return new Vector2I(pos.X, pos.Y + 1);
+		yield return new Vector2I(pos.X - 1, pos.Y);
+	}
+
+	private Dictionary<string, string> SanitizePreferredFacilities(Dictionary<string, string> preferredFacility)
+	{
+		var sanitized = new Dictionary<string, string>();
+		_lastPreferredFacility.Clear();
+
+		if (_housePositions.Count == 0)
+			return sanitized;
+
+		var walkable = BuildWalkableTiles();
+		var facilityIds = new List<string> { "Clinic" };
+		for (int i = 0; i < _hospitalPositions.Count; i++)
+			facilityIds.Add($"Hospital_{i}");
+
+		for (int i = 0; i < _housePositions.Count; i++)
+		{
+			string houseId = $"House_{i}";
+			Vector2I houseGrid = _housePositions[i];
+			string assignedFacility = null;
+			preferredFacility?.TryGetValue(houseId, out assignedFacility);
+
+			var distances = ComputeWalkableDistances(houseGrid, walkable);
+			string bestFacility = "Disconnected";
+			int bestDistance = int.MaxValue;
+
+			if (!string.IsNullOrEmpty(assignedFacility) &&
+				assignedFacility != "Disconnected" &&
+				TryGetFacilityGrid(assignedFacility, out var assignedGrid) &&
+				distances.ContainsKey(assignedGrid))
+			{
+				bestFacility = assignedFacility;
+			}
+			else
+			{
+				foreach (string facilityId in facilityIds)
+				{
+					if (!TryGetFacilityGrid(facilityId, out var facilityGrid)) continue;
+					if (!distances.TryGetValue(facilityGrid, out int distance)) continue;
+
+					int score = distance;
+					if (facilityId == "Clinic")
+						score += 1; // mirror the clinic's small baseline penalty
+
+					if (score < bestDistance)
+					{
+						bestDistance = score;
+						bestFacility = facilityId;
+					}
+				}
+			}
+
+			sanitized[houseId] = bestFacility;
+			_lastPreferredFacility[houseId] = bestFacility;
+		}
+
+		return sanitized;
 	}
 
 	// -------------------------------------------------------------------------
@@ -1379,6 +1534,13 @@ public partial class Main : Node2D
 	private void EndTurn()
 	{
 		if (_gameOver || _turnInProgress) return;
+		if (_budgetLossPending)
+		{
+			_gameOver = true;
+			DisableAllButtons();
+			ShowGameOverScreen("The clinic stayed in debt for a full turn.");
+			return;
+		}
 		_turnInProgress = true;
 		_endTurnButton.Disabled = true;
 		_resolveTurnAfterResponse = true;
@@ -1496,12 +1658,14 @@ public partial class Main : Node2D
 			return;
 		}
 
-		// Apply player roads (built by setup phase or city's own routing)
+		// Apply all topology changes before trusting the solver's facility choices.
 		int playerRoadsBuilt = ApplyRoadList(response?.built_roads, isOptimizerRoad: false, animate: _resolveTurnAfterResponse);
 		int cityRoadsBuilt   = ApplyRoadList(response?.optimizer_roads, isOptimizerRoad: true, animate: _resolveTurnAfterResponse);
+		int destroyedRoads   = ApplyDestroyedRoads(response?.destroyed_roads);
 
-		UpdateFacilityPatientCounts(response);
-		DrawRouteLines(response?.preferred_facility);
+		var preferredFacility = SanitizePreferredFacilities(response?.preferred_facility);
+		UpdateFacilityPatientCounts(preferredFacility);
+		DrawRouteLines(preferredFacility);
 
 		int clinicCount  = response?.clinic_count ?? 0;
 		float clinicRatio = response?.clinic_ratio ?? 0f;
@@ -1510,7 +1674,7 @@ public partial class Main : Node2D
 		if (_resolveTurnAfterResponse)
 		{
 			float roadSpend = playerRoadsBuilt * RoadCost;
-			ResolveTurn(response, roadSpend, playerRoadsBuilt, cityRoadsBuilt);
+			ResolveTurn(response, roadSpend, playerRoadsBuilt, cityRoadsBuilt, destroyedRoads);
 			_resolveTurnAfterResponse = false;
 		}
 		else
@@ -1525,7 +1689,7 @@ public partial class Main : Node2D
 		UpdateHud();
 	}
 
-	private void ResolveTurn(SolveResponse response, float roadSpend, int playerRoads, int cityRoads)
+	private void ResolveTurn(SolveResponse response, float roadSpend, int playerRoads, int cityRoads, int destroyedRoads)
 	{
 		_day++;
 
@@ -1545,6 +1709,7 @@ public partial class Main : Node2D
 		_playerBudget -= roadSpend;
 		_clinicMoney  += income - upkeep;
 		_clinicMoney  -= roadSpend;
+		_budgetLossPending = _playerBudget < 0f;
 
 		// City counter-turn budget
 		_citizenBudget += 3f + (_housePositions.Count * 0.3f);
@@ -1560,11 +1725,10 @@ public partial class Main : Node2D
 				RefreshRoadAt(kv.Key);
 
 		if (CheckLoseCondition(clinicRatio)) return;
-
-		int destroyedRoads = ApplyDestroyedRoads(response?.destroyed_roads);
-		_statusLabel.Text =
-			$"Day {_day}: {clinicCount}/{_housePositions.Count} chose clinic ({clinicRatio * 100f:0.0}%). " +
-			$"Income: ${income:0.0} | Upkeep: ${upkeep:0.0} | City built {cityRoads}, destroyed {destroyedRoads} road(s).";
+		_statusLabel.Text = _budgetLossPending
+			? $"Day {_day}: {clinicCount}/{_housePositions.Count} chose clinic ({clinicRatio * 100f:0.0}%). Budget is below $0. End Turn will trigger game over."
+			: $"Day {_day}: {clinicCount}/{_housePositions.Count} chose clinic ({clinicRatio * 100f:0.0}%). " +
+			  $"Income: ${income:0.0} | Upkeep: ${upkeep:0.0} | City built {cityRoads}, destroyed {destroyedRoads} road(s).";
 	}
 
 	private int ApplyRoadList(List<GridPoint> roads, bool isOptimizerRoad, bool animate)
@@ -1595,18 +1759,16 @@ public partial class Main : Node2D
 		return count;
 	}
 
-	private void UpdateFacilityPatientCounts(SolveResponse response)
+	private void UpdateFacilityPatientCounts(Dictionary<string, string> preferredFacility)
 	{
 		_facilityPatientCounts.Clear();
-		if (response?.preferred_facility == null) return;
-		foreach (var kv in response.preferred_facility)
+		if (preferredFacility == null) return;
+		foreach (var kv in preferredFacility)
 		{
 			string fid = kv.Value;
-			if (string.IsNullOrEmpty(fid)) continue;
+			if (string.IsNullOrEmpty(fid) || fid == "Disconnected") continue;
 			_facilityPatientCounts[fid] = _facilityPatientCounts.TryGetValue(fid, out int cur) ? cur + 1 : 1;
 		}
-		if (response.clinic_count >= 0)
-			_facilityPatientCounts["Clinic"] = response.clinic_count;
 	}
 
 	// -------------------------------------------------------------------------

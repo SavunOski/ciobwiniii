@@ -1,6 +1,7 @@
 using Godot;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using System.Text.Json;
 
@@ -10,9 +11,18 @@ public partial class Main : Node2D
 	private HttpRequest _http;
 	private bool _isDragging = false;
 	private Texture2D _roadEWTexture;
+	private Texture2D _roadTileTexture;
+	private readonly Dictionary<string, Texture2D> _roadTextures = new();
+	private readonly Dictionary<string, int> _facilityPatientCounts = new();
 
 	private const int GridSize = 20;
 	private const int TileSpacing = 64;
+
+	// Road neighbor bit flags (N/E/S/W)
+	private const int RoadN = 1;
+	private const int RoadE = 2;
+	private const int RoadS = 4;
+	private const int RoadW = 8;
 
 	private const int HospitalCount = 4;
 	private const int HouseCount = 4; // must be < hospitals + clinic
@@ -45,6 +55,9 @@ public partial class Main : Node2D
 	private bool _resolveTurnAfterResponse = false;
 	private bool _gameOver = false;
 
+	private Vector2I _lastHoveredTile = new(-1, -1);
+	private float _hoverTimer = 0f;
+
 	// HUD
 	private Label _dayLabel;
 	private Label _playerBudgetLabel;
@@ -52,6 +65,7 @@ public partial class Main : Node2D
 	private Label _clinicMoneyLabel;
 	private Label _toolLabel;
 	private Label _statusLabel;
+	private Label _hoverLabel;
 
 	private Button _pointerButton;
 	private Button _roadButton;
@@ -72,9 +86,7 @@ public partial class Main : Node2D
 		_camera = GetNode<Camera2D>("Camera2D");
 		_camera.MakeCurrent();
 
-		_roadEWTexture = GD.Load<Texture2D>("res://roads/roadEW.tga");
-		if (_roadEWTexture == null)
-			GD.PrintErr("Missing road texture: res://roads/roadEW.tga");
+		LoadRoadTextures();
 
 		_http = new HttpRequest();
 		AddChild(_http);
@@ -89,6 +101,118 @@ public partial class Main : Node2D
 		SetSelectedTool(BuildTool.None);
 
 		CallDeferred(nameof(SendInitialOptimizationRequest));
+	}
+
+	public override void _Process(double delta)
+	{
+		UpdateHoverStats(delta);
+	}
+
+	private void UpdateHoverStats(double delta)
+	{
+		if (_hoverLabel == null) return;
+
+		// Ignore map placement when cursor is over HUD controls.
+		if (GetViewport().GuiGetHoveredControl() != null)
+		{
+			_hoverLabel.Text = "";
+			_hoverTimer = 0f;
+			return;
+		}
+
+		Vector2 mouseWorld = GetGlobalMousePosition();
+		Vector2I gridPos = new(
+			Mathf.FloorToInt(mouseWorld.X / TileSpacing),
+			Mathf.FloorToInt(mouseWorld.Y / TileSpacing)
+		);
+
+		if (gridPos.X < 0 || gridPos.X >= GridSize || gridPos.Y < 0 || gridPos.Y >= GridSize)
+		{
+			_hoverLabel.Text = "";
+			_hoverTimer = 0f;
+			return;
+		}
+
+		if (gridPos == _lastHoveredTile)
+		{
+			_hoverTimer += (float)delta;
+		}
+		else
+		{
+			_lastHoveredTile = gridPos;
+			_hoverTimer = 0f;
+			_hoverLabel.Text = "";
+		}
+
+		if (_hoverTimer >= 1.0f)
+		{
+			if (_structures.TryGetValue(gridPos, out var structure))
+			{
+				if (structure == BuildTool.Road)
+				{
+					float congestion = GetRoadCongestionValue(gridPos);
+					_hoverLabel.Text = $"Road ({gridPos.X},{gridPos.Y}) | Congestion: {congestion:0.0}";
+				}
+				else if (structure == BuildTool.Mall)
+				{
+					float caused = GetMallCongestionCaused(gridPos);
+					_hoverLabel.Text = $"Mall ({gridPos.X},{gridPos.Y}) | Added Congestion: +{caused:0.0}";
+				}
+				return;
+			}
+
+			int hospitalIdx = _hospitalPositions.IndexOf(gridPos);
+			if (hospitalIdx >= 0)
+			{
+				string facilityId = $"Hospital_{hospitalIdx}";
+				int patients = GetFacilityPatients(facilityId);
+				float revenue = patients * RevenuePerPatient;
+				_hoverLabel.Text = $"Hospital {hospitalIdx} | Patients: {patients} | Revenue: ${revenue:0.0}";
+				return;
+			}
+
+			if (gridPos == _clinicPos)
+			{
+				int patients = GetFacilityPatients("Clinic");
+				float revenue = patients * RevenuePerPatient;
+				_hoverLabel.Text = $"Clinic | Patients: {patients} | Revenue: ${revenue:0.0}";
+				return;
+			}
+
+			_hoverLabel.Text = ""; // Grass tile or generic entity
+		}
+	}
+
+	private float GetRoadCongestionValue(Vector2I roadPos)
+	{
+		float baseCongestion = ((roadPos.X * 3 + roadPos.Y) % 5) * 0.4f;
+		float mallImpact = 0f;
+
+		foreach (var kv in _structures)
+		{
+			if (kv.Value == BuildTool.Mall && Manhattan(kv.Key, roadPos) <= 1)
+				mallImpact += 1.4f;
+		}
+
+		return baseCongestion + mallImpact;
+	}
+
+	private float GetMallCongestionCaused(Vector2I mallPos)
+	{
+		int affectedRoads = 0;
+
+		foreach (var kv in _structures)
+		{
+			if (kv.Value == BuildTool.Road && Manhattan(kv.Key, mallPos) <= 1)
+				affectedRoads++;
+		}
+
+		return affectedRoads * 1.4f;
+	}
+
+	private int GetFacilityPatients(string facilityId)
+	{
+		return _facilityPatientCounts.TryGetValue(facilityId, out var count) ? count : 0;
 	}
 
 	private void GenerateGrid()
@@ -236,60 +360,355 @@ public partial class Main : Node2D
 
 	private void PlaceStructure(Vector2I gridPos, BuildTool tool)
 	{
-		if (_structureNodes.TryGetValue(gridPos, out var oldNode))
+		_structures[gridPos] = tool;
+
+		if (tool == BuildTool.Road)
 		{
-			oldNode.QueueFree();
-			_structureNodes.Remove(gridPos);
+			RefreshRoadAt(gridPos);
+			RefreshRoadAt(new Vector2I(gridPos.X, gridPos.Y - 1));
+			RefreshRoadAt(new Vector2I(gridPos.X + 1, gridPos.Y));
+			RefreshRoadAt(new Vector2I(gridPos.X, gridPos.Y + 1));
+			RefreshRoadAt(new Vector2I(gridPos.X - 1, gridPos.Y));
+			return;
 		}
 
-		Control nodeToStore;
+		RemoveStructureNode(gridPos);
 
-		if (tool == BuildTool.Road && _roadEWTexture != null)
+		var rect = new ColorRect
+		{
+			Size = new Vector2(TileSpacing - 14, TileSpacing - 14),
+			Position = new Vector2(gridPos.X * TileSpacing + 6, gridPos.Y * TileSpacing + 6),
+			Color = new Color(0.75f, 0.4f, 0.15f, 0.95f),
+			Name = $"Structure_{gridPos.X}_{gridPos.Y}",
+			ZIndex = 2,
+			MouseFilter = Control.MouseFilterEnum.Ignore
+		};
+
+		var label = new Label
+		{
+			Text = "🛍️",
+			Size = rect.Size,
+			HorizontalAlignment = HorizontalAlignment.Center,
+			VerticalAlignment = VerticalAlignment.Center
+		};
+		label.AddThemeFontSizeOverride("font_size", 24);
+
+		rect.AddChild(label);
+		AddChild(rect);
+		_structureNodes[gridPos] = rect;
+	}
+
+	private void LoadRoadTextures()
+	{
+		_roadTextures.Clear();
+
+		_roadEWTexture = GD.Load<Texture2D>("res://roads/roadEW.tga");
+		if (_roadEWTexture == null)
+		{
+			GD.PrintErr("Missing road texture: res://roads/roadEW.tga");
+			return;
+		}
+
+		_roadTileTexture = ToSingleTileTexture(_roadEWTexture);
+		_roadTextures["EW"] = _roadTileTexture;
+
+		var dir = DirAccess.Open("res://roads");
+		if (dir == null)
+			return;
+
+		dir.ListDirBegin();
+		while (true)
+		{
+			string file = dir.GetNext();
+			if (string.IsNullOrEmpty(file))
+				break;
+			if (dir.CurrentIsDir())
+				continue;
+			if (!file.StartsWith("road", StringComparison.OrdinalIgnoreCase))
+				continue;
+
+			string ext = Path.GetExtension(file).ToLowerInvariant();
+			if (ext != ".tga" && ext != ".png" && ext != ".webp")
+				continue;
+
+			string nameNoExt = Path.GetFileNameWithoutExtension(file);
+			string suffix = nameNoExt.Length > 4 ? nameNoExt.Substring(4) : string.Empty;
+			string key = NormalizeRoadKey(suffix);
+			if (string.IsNullOrEmpty(key))
+				continue;
+
+			var tex = GD.Load<Texture2D>($"res://roads/{file}");
+			if (tex != null)
+				_roadTextures[key] = ToSingleTileTexture(tex);
+		}
+		dir.ListDirEnd();
+	}
+
+	private static Texture2D ToSingleTileTexture(Texture2D texture)
+	{
+		if (texture == null)
+			return null;
+
+		Vector2 size = texture.GetSize();
+		int w = Mathf.RoundToInt(size.X);
+		int h = Mathf.RoundToInt(size.Y);
+
+		int tileW = (w % 3 == 0) ? w / 3 : w;
+		int tileH = (h % 3 == 0) ? h / 3 : h;
+
+		if (tileW == w && tileH == h && (w > TileSpacing || h > TileSpacing))
+		{
+			tileW = Mathf.Min(TileSpacing, w);
+			tileH = Mathf.Min(TileSpacing, h);
+		}
+
+		if (tileW == w && tileH == h)
+			return texture;
+
+		return new AtlasTexture
+		{
+			Atlas = texture,
+			Region = new Rect2((w - tileW) * 0.5f, (h - tileH) * 0.5f, tileW, tileH)
+		};
+	}
+
+	private static string NormalizeRoadKey(string raw)
+	{
+		if (string.IsNullOrWhiteSpace(raw))
+			return string.Empty;
+
+		bool n = false, e = false, s = false, w = false;
+		string upper = raw.Trim().ToUpperInvariant();
+
+		// tokenize by non-letters/non-digits
+		var token = new StringBuilder();
+		void FlushToken()
+		{
+			if (token.Length == 0) return;
+			ApplyRoadToken(token.ToString(), ref n, ref e, ref s, ref w);
+			token.Clear();
+		}
+
+		foreach (char c in upper)
+		{
+			if (char.IsLetterOrDigit(c))
+				token.Append(c);
+			else
+				FlushToken();
+		}
+		FlushToken();
+
+		// fallback: only if entire raw is made of NESW letters (prevents "CROSS" => "S")
+		bool onlyDirs = true;
+		foreach (char c in upper)
+		{
+			if (c == '_' || c == '-' || c == ' ') continue;
+			if (c is not ('N' or 'E' or 'S' or 'W'))
+			{
+				onlyDirs = false;
+				break;
+			}
+		}
+		if (!n && !e && !s && !w && onlyDirs)
+		{
+			foreach (char c in upper)
+			{
+				if (c == 'N') n = true;
+				else if (c == 'E') e = true;
+				else if (c == 'S') s = true;
+				else if (c == 'W') w = true;
+			}
+		}
+
+		var sb = new StringBuilder(4);
+		if (n) sb.Append('N');
+		if (e) sb.Append('E');
+		if (s) sb.Append('S');
+		if (w) sb.Append('W');
+		return sb.ToString();
+	}
+
+	private static void ApplyRoadToken(string t, ref bool n, ref bool e, ref bool s, ref bool w)
+	{
+		switch (t)
+		{
+			case "N":
+			case "NORTH": n = true; return;
+			case "E":
+			case "EAST": e = true; return;
+			case "S":
+			case "SOUTH": s = true; return;
+			case "W":
+			case "WEST": w = true; return;
+
+			case "NS":
+			case "SN":
+			case "V":
+			case "VERT":
+			case "VERTICAL": n = s = true; return;
+
+			case "EW":
+			case "WE":
+			case "H":
+			case "HOR":
+			case "HORIZONTAL": e = w = true; return;
+
+			case "NESW":
+			case "CROSS":
+			case "X":
+			case "PLUS":
+			case "INTERSECTION": n = e = s = w = true; return;
+		}
+
+		// direction combos in one token: NE, EN, T_NES-like compact forms
+		foreach (char c in t)
+		{
+			if (c == 'N') n = true;
+			else if (c == 'E') e = true;
+			else if (c == 'S') s = true;
+			else if (c == 'W') w = true;
+		}
+	}
+
+	private void RefreshRoadAt(Vector2I gridPos)
+	{
+		if (!_structures.TryGetValue(gridPos, out var tool) || tool != BuildTool.Road)
+			return;
+
+		RemoveStructureNode(gridPos);
+		int mask = GetRoadMask(gridPos);
+
+		if (TryGetRoadTexture(mask, out var tex, out float rotation))
 		{
 			var road = new TextureRect
 			{
 				Name = $"Structure_{gridPos.X}_{gridPos.Y}",
 				Position = new Vector2(gridPos.X * TileSpacing + 1, gridPos.Y * TileSpacing + 1),
 				Size = new Vector2(TileSpacing - 2, TileSpacing - 2),
-				Texture = _roadEWTexture,
+				Texture = tex,
 				StretchMode = TextureRect.StretchModeEnum.Scale,
 				ZIndex = 2,
 				MouseFilter = Control.MouseFilterEnum.Ignore
 			};
 
+			if (!Mathf.IsZeroApprox(rotation))
+			{
+				road.PivotOffset = road.Size * 0.5f;
+				road.Rotation = rotation;
+			}
+
 			AddChild(road);
-			nodeToStore = road;
+			_structureNodes[gridPos] = road;
+			return;
 		}
-		else
+
+		var fallback = CreateConnectedRoadFallback(gridPos, mask);
+		AddChild(fallback);
+		_structureNodes[gridPos] = fallback;
+	}
+
+	private void RemoveStructureNode(Vector2I gridPos)
+	{
+		if (_structureNodes.TryGetValue(gridPos, out var oldNode))
 		{
-			var rect = new ColorRect
-			{
-				Size = new Vector2(TileSpacing - 14, TileSpacing - 14),
-				Position = new Vector2(gridPos.X * TileSpacing + 6, gridPos.Y * TileSpacing + 6),
-				Color = tool == BuildTool.Road
-					? new Color(0.3f, 0.3f, 0.3f, 0.95f)
-					: new Color(0.75f, 0.4f, 0.15f, 0.95f),
-				Name = $"Structure_{gridPos.X}_{gridPos.Y}",
-				ZIndex = 2,
-				MouseFilter = Control.MouseFilterEnum.Ignore
-			};
+			oldNode.QueueFree();
+			_structureNodes.Remove(gridPos);
+		}
+	}
 
-			var label = new Label
-			{
-				Text = tool == BuildTool.Road ? "🛣️" : "🛍️",
-				Size = rect.Size,
-				HorizontalAlignment = HorizontalAlignment.Center,
-				VerticalAlignment = VerticalAlignment.Center
-			};
-			label.AddThemeFontSizeOverride("font_size", 24);
+	private int GetRoadMask(Vector2I p)
+	{
+		int mask = 0;
+		if (IsRoadAt(new Vector2I(p.X, p.Y - 1))) mask |= RoadN;
+		if (IsRoadAt(new Vector2I(p.X + 1, p.Y))) mask |= RoadE;
+		if (IsRoadAt(new Vector2I(p.X, p.Y + 1))) mask |= RoadS;
+		if (IsRoadAt(new Vector2I(p.X - 1, p.Y))) mask |= RoadW;
+		return mask;
+	}
 
-			rect.AddChild(label);
-			AddChild(rect);
-			nodeToStore = rect;
+	private bool IsRoadAt(Vector2I p)
+	{
+		return _structures.TryGetValue(p, out var t) && t == BuildTool.Road;
+	}
+
+	private static string MaskToRoadKey(int mask)
+	{
+		var sb = new StringBuilder(4);
+		if ((mask & RoadN) != 0) sb.Append('N');
+		if ((mask & RoadE) != 0) sb.Append('E');
+		if ((mask & RoadS) != 0) sb.Append('S');
+		if ((mask & RoadW) != 0) sb.Append('W');
+		return sb.ToString();
+	}
+
+	private bool TryGetRoadTexture(int mask, out Texture2D texture, out float rotation)
+	{
+		texture = null;
+		rotation = 0f;
+
+		string key = MaskToRoadKey(mask);
+		if (_roadTextures.TryGetValue(key, out texture))
+			return true;
+
+		if ((key == "NS" || key == "N" || key == "S") && _roadTextures.TryGetValue("EW", out texture))
+		{
+			rotation = Mathf.Pi * 0.5f;
+			return true;
 		}
 
-		_structures[gridPos] = tool;
-		_structureNodes[gridPos] = nodeToStore;
+		if ((key == "E" || key == "W") && _roadTextures.TryGetValue("EW", out texture))
+			return true;
+
+		return false;
+	}
+
+	private Control CreateConnectedRoadFallback(Vector2I gridPos, int mask)
+	{
+		float size = TileSpacing - 2;
+		float thickness = Mathf.Max(10f, Mathf.Round(size * 0.36f));
+		float center = (size - thickness) * 0.5f;
+
+		var root = new Control
+		{
+			Name = $"Structure_{gridPos.X}_{gridPos.Y}",
+			Position = new Vector2(gridPos.X * TileSpacing + 1, gridPos.Y * TileSpacing + 1),
+			Size = new Vector2(size, size),
+			ZIndex = 2,
+			ClipContents = true,
+			MouseFilter = Control.MouseFilterEnum.Ignore
+		};
+
+		AddRoadPart(root, new Rect2(center, center, thickness, thickness));
+		if ((mask & RoadN) != 0) AddRoadPart(root, new Rect2(center, 0, thickness, center + 1f));
+		if ((mask & RoadE) != 0) AddRoadPart(root, new Rect2(center + thickness - 1f, center, size - (center + thickness - 1f), thickness));
+		if ((mask & RoadS) != 0) AddRoadPart(root, new Rect2(center, center + thickness - 1f, thickness, size - (center + thickness - 1f)));
+		if ((mask & RoadW) != 0) AddRoadPart(root, new Rect2(0, center, center + 1f, thickness));
+
+		return root;
+	}
+
+	private void AddRoadPart(Control parent, Rect2 rect)
+	{
+		if (_roadTileTexture != null)
+		{
+			parent.AddChild(new TextureRect
+			{
+				Position = rect.Position,
+				Size = rect.Size,
+				Texture = _roadTileTexture,
+				StretchMode = TextureRect.StretchModeEnum.Scale,
+				MouseFilter = Control.MouseFilterEnum.Ignore
+			});
+			return;
+		}
+
+		parent.AddChild(new ColorRect
+		{
+			Position = rect.Position,
+			Size = rect.Size,
+			Color = new Color(0.3f, 0.3f, 0.3f, 0.95f),
+			MouseFilter = Control.MouseFilterEnum.Ignore
+		});
 	}
 
 	private void CreateHud()
@@ -315,6 +734,8 @@ public partial class Main : Node2D
 		_toolLabel = new Label();
 		_statusLabel = new Label { CustomMinimumSize = new Vector2(360, 56) };
 		_statusLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+		_hoverLabel = new Label { CustomMinimumSize = new Vector2(360, 40) };
+		_hoverLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
 
 		root.AddChild(_dayLabel);
 		root.AddChild(_clinicMoneyLabel);
@@ -346,6 +767,7 @@ public partial class Main : Node2D
 		root.AddChild(_endTurnButton);
 
 		root.AddChild(_statusLabel);
+		root.AddChild(_hoverLabel);
 	}
 
 	private void SetSelectedTool(BuildTool tool)
@@ -587,6 +1009,8 @@ public partial class Main : Node2D
 			GD.PrintErr($"Failed to parse optimizer response: {e.Message}");
 		}
 
+		UpdateFacilityPatientCounts(response);
+
 		if (_resolveTurnAfterResponse)
 		{
 			ResolveTurn(response);
@@ -709,6 +1133,29 @@ public partial class Main : Node2D
 		{
 			_camera.Position -= mm.Relative / _camera.Zoom;
 		}
+	}
+
+	private void UpdateFacilityPatientCounts(SolveResponse response)
+	{
+		_facilityPatientCounts.Clear();
+
+		if (response?.preferred_facility == null)
+			return;
+
+		foreach (var kv in response.preferred_facility)
+		{
+			string facilityId = kv.Value;
+			if (string.IsNullOrEmpty(facilityId))
+				continue;
+
+			if (_facilityPatientCounts.TryGetValue(facilityId, out int current))
+				_facilityPatientCounts[facilityId] = current + 1;
+			else
+				_facilityPatientCounts[facilityId] = 1;
+		}
+
+		if (response.clinic_count >= 0)
+			_facilityPatientCounts["Clinic"] = response.clinic_count;
 	}
 }
 

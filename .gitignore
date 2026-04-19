@@ -1,3 +1,31 @@
-# Godot 4+ specific ignores
+# Godot 4+ generated data
 .godot/
 /android/
+
+# Godot export/build outputs
+*.apk
+*.aab
+*.ipa
+*.pck
+
+# .NET / C# build outputs
+.mono/
+[Bb]in/
+[Oo]bj/
+*.user
+*.rsuser
+*.suo
+
+# Python virtualenvs and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local tool state
+.codex

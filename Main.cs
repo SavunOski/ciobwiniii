@@ -47,6 +47,7 @@ public partial class Main : Node2D
 	private float _playerBudget = 40f;
 	private float _citizenBudget = 30f;
 	private float _clinicMoney = 40f;
+	private float _previousDayProfit = 0f;
 
 	private float _citizenHospitalBonus = 0f; // lowers hospital cost over time
 	private float _citizenClinicPenalty = 0f; // raises clinic cost over time
@@ -61,15 +62,22 @@ public partial class Main : Node2D
 	// HUD
 	private Label _dayLabel;
 	private Label _playerBudgetLabel;
-	private Label _citizenBudgetLabel;
-	private Label _clinicMoneyLabel;
+	private Label _optimizerBudgetLabel;
+	private Label _previousProfitLabel;
 	private Label _toolLabel;
 	private Label _statusLabel;
 	private Label _hoverLabel;
+	private PanelContainer _infoPanel;
+	private PanelContainer _actionsPanel;
 
 	private Button _pointerButton;
-	private Button _roadButton;
-	private Button _mallButton;
+	private Button _roadBuildButton;
+	private Button _roadDestroyButton;
+	private Button _roadUpgradeButton;
+	private Button _mallBuildButton;
+	private Button _mallDestroyButton;
+	private Button _cutHospitalFundingButton;
+	private Button _roadBlockageButton;
 	private Button _endTurnButton;
 
 	private BuildTool _selectedTool = BuildTool.None;
@@ -105,6 +113,7 @@ public partial class Main : Node2D
 
 	public override void _Process(double delta)
 	{
+		UpdateHudLayout();
 		UpdateHoverStats(delta);
 	}
 
@@ -717,57 +726,102 @@ public partial class Main : Node2D
 		layer.Name = "HUDLayer";
 		AddChild(layer);
 
-		var panel = new PanelContainer
+		_infoPanel = new PanelContainer
 		{
-			Position = new Vector2(12, 12),
-			CustomMinimumSize = new Vector2(380, 280)
+			CustomMinimumSize = new Vector2(320, 140)
 		};
-		layer.AddChild(panel);
+		layer.AddChild(_infoPanel);
 
-		var root = new VBoxContainer();
-		panel.AddChild(root);
+		var infoRoot = new VBoxContainer();
+		_infoPanel.AddChild(infoRoot);
 
 		_dayLabel = new Label();
 		_playerBudgetLabel = new Label();
-		_citizenBudgetLabel = new Label();
-		_clinicMoneyLabel = new Label();
+		_optimizerBudgetLabel = new Label();
+		_previousProfitLabel = new Label();
 		_toolLabel = new Label();
 		_statusLabel = new Label { CustomMinimumSize = new Vector2(360, 56) };
 		_statusLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
 		_hoverLabel = new Label { CustomMinimumSize = new Vector2(360, 40) };
 		_hoverLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
 
-		root.AddChild(_dayLabel);
-		root.AddChild(_clinicMoneyLabel);
-		root.AddChild(_playerBudgetLabel);
-		root.AddChild(_citizenBudgetLabel);
+		infoRoot.AddChild(_dayLabel);
+		infoRoot.AddChild(_playerBudgetLabel);
+		infoRoot.AddChild(_optimizerBudgetLabel);
+		infoRoot.AddChild(_previousProfitLabel);
 
-		var toolsTitle = new Label { Text = "Building Tools:" };
-		root.AddChild(toolsTitle);
+		_actionsPanel = new PanelContainer
+		{
+			CustomMinimumSize = new Vector2(360, 300)
+		};
+		layer.AddChild(_actionsPanel);
 
-		var toolRow = new HBoxContainer();
-		root.AddChild(toolRow);
+		var actionsRoot = new VBoxContainer();
+		_actionsPanel.AddChild(actionsRoot);
+
+		actionsRoot.AddChild(new Label { Text = "Actions" });
 
 		_pointerButton = new Button { Text = "Pointer", ToggleMode = true };
-		_roadButton = new Button { Text = $"Road (${RoadCost:0})", ToggleMode = true };
-		_mallButton = new Button { Text = $"Mall (${MallCost:0})", ToggleMode = true };
-
 		_pointerButton.Pressed += () => SetSelectedTool(BuildTool.None);
-		_roadButton.Pressed += () => SetSelectedTool(BuildTool.Road);
-		_mallButton.Pressed += () => SetSelectedTool(BuildTool.Mall);
+		actionsRoot.AddChild(_pointerButton);
 
-		toolRow.AddChild(_pointerButton);
-		toolRow.AddChild(_roadButton);
-		toolRow.AddChild(_mallButton);
+		actionsRoot.AddChild(new Label { Text = "Road Management" });
+		_roadBuildButton = new Button { Text = $"Build Road (${RoadCost:0})", ToggleMode = true };
+		_roadDestroyButton = new Button { Text = "Destroy Road" };
+		_roadUpgradeButton = new Button { Text = "Upgrade Road" };
+		_roadBuildButton.Pressed += () => SetSelectedTool(BuildTool.Road);
+		_roadDestroyButton.Pressed += () => ShowUnavailableAction("Road destroy is not implemented yet.");
+		_roadUpgradeButton.Pressed += () => ShowUnavailableAction("Road upgrade is not implemented yet.");
+		actionsRoot.AddChild(_roadBuildButton);
+		actionsRoot.AddChild(_roadDestroyButton);
+		actionsRoot.AddChild(_roadUpgradeButton);
 
-		root.AddChild(_toolLabel);
+		actionsRoot.AddChild(new Label { Text = "Infrastructure" });
+		_mallBuildButton = new Button { Text = $"Build Mall (${MallCost:0})", ToggleMode = true };
+		_mallDestroyButton = new Button { Text = "Destroy Mall" };
+		_mallBuildButton.Pressed += () => SetSelectedTool(BuildTool.Mall);
+		_mallDestroyButton.Pressed += () => ShowUnavailableAction("Mall destroy is not implemented yet.");
+		actionsRoot.AddChild(_mallBuildButton);
+		actionsRoot.AddChild(_mallDestroyButton);
+
+		actionsRoot.AddChild(new Label { Text = "Temporary Actions" });
+		_cutHospitalFundingButton = new Button { Text = "Cut Hospital Funding" };
+		_roadBlockageButton = new Button { Text = "Road Blockage" };
+		_cutHospitalFundingButton.Pressed += () => ShowUnavailableAction("Cut Hospital Funding is not implemented yet.");
+		_roadBlockageButton.Pressed += () => ShowUnavailableAction("Road Blockage is not implemented yet.");
+		actionsRoot.AddChild(_cutHospitalFundingButton);
+		actionsRoot.AddChild(_roadBlockageButton);
+
+		actionsRoot.AddChild(_toolLabel);
 
 		_endTurnButton = new Button { Text = "End Turn (Send to GAMSPy)" };
 		_endTurnButton.Pressed += EndTurn;
-		root.AddChild(_endTurnButton);
+		actionsRoot.AddChild(_endTurnButton);
 
-		root.AddChild(_statusLabel);
-		root.AddChild(_hoverLabel);
+		actionsRoot.AddChild(_statusLabel);
+		actionsRoot.AddChild(_hoverLabel);
+
+		UpdateHudLayout();
+	}
+
+	private void UpdateHudLayout()
+	{
+		if (_infoPanel == null || _actionsPanel == null)
+			return;
+
+		float viewportWidth = GetViewportRect().Size.X;
+		float infoWidth = _infoPanel.Size.X > 0f
+			? _infoPanel.Size.X
+			: _infoPanel.CustomMinimumSize.X;
+
+		_infoPanel.Position = new Vector2(viewportWidth - infoWidth - 12f, 12f);
+
+		float viewportHeight = GetViewportRect().Size.Y;
+		float actionsHeight = _actionsPanel.Size.Y > 0f
+			? _actionsPanel.Size.Y
+			: _actionsPanel.CustomMinimumSize.Y;
+
+		_actionsPanel.Position = new Vector2(12, viewportHeight - actionsHeight - 12f);
 	}
 
 	private void SetSelectedTool(BuildTool tool)
@@ -775,8 +829,8 @@ public partial class Main : Node2D
 		_selectedTool = tool;
 
 		_pointerButton.ButtonPressed = tool == BuildTool.None;
-		_roadButton.ButtonPressed = tool == BuildTool.Road;
-		_mallButton.ButtonPressed = tool == BuildTool.Mall;
+		_roadBuildButton.ButtonPressed = tool == BuildTool.Road;
+		_mallBuildButton.ButtonPressed = tool == BuildTool.Mall;
 
 		_toolLabel.Text = $"Selected: {ToolName(tool)}";
 	}
@@ -795,10 +849,10 @@ public partial class Main : Node2D
 	{
 		if (_dayLabel == null) return;
 
-		_dayLabel.Text = $"Days Survived: {_day}";
-		_clinicMoneyLabel.Text = $"Clinic Money: ${_clinicMoney:0.0}";
-		_playerBudgetLabel.Text = $"Your Budget: ${_playerBudget:0.0}";
-		_citizenBudgetLabel.Text = $"Citizen Budget: ${_citizenBudget:0.0}";
+		_dayLabel.Text = $"Turn Count: {_day}";
+		_playerBudgetLabel.Text = $"Current Budget: ${_playerBudget:0.0}";
+		_optimizerBudgetLabel.Text = $"Optimizer Budget: ${_citizenBudget:0.0}";
+		_previousProfitLabel.Text = $"Previous Day's Profit: ${_previousDayProfit:0.0}";
 	}
 
 	private float GetToolCost(BuildTool tool)
@@ -842,14 +896,13 @@ public partial class Main : Node2D
 		}
 
 		float cost = GetToolCost(_selectedTool);
-		if (_playerBudget < cost || _clinicMoney < cost)
+		if (_playerBudget < cost)
 		{
 			_statusLabel.Text = "Not enough budget.";
 			return;
 		}
 
 		_playerBudget -= cost;
-		_clinicMoney -= cost;
 
 		PlaceStructure(gridPos, _selectedTool);
 		UpdateHud();
@@ -930,14 +983,20 @@ public partial class Main : Node2D
 			});
 		}
 
-		var houses = new List<string>();
+		var houses = new List<HouseData>();
 		var houseAccess = new List<FacilityCost>();
+		var existingRoads = new List<GridPoint>();
 
 		for (int i = 0; i < _housePositions.Count; i++)
 		{
 			string houseId = $"House_{i}";
 			Vector2I housePos = _housePositions[i];
-			houses.Add(houseId);
+			houses.Add(new HouseData
+			{
+				id = houseId,
+				x = housePos.X,
+				y = housePos.Y
+			});
 
 			houseAccess.Add(new FacilityCost
 			{
@@ -957,12 +1016,28 @@ public partial class Main : Node2D
 			}
 		}
 
+		foreach (var kv in _structures)
+		{
+			if (kv.Value != BuildTool.Road)
+				continue;
+
+			existingRoads.Add(new GridPoint
+			{
+				x = kv.Key.X,
+				y = kv.Key.Y
+			});
+		}
+
 		return new SolveRequest
 		{
 			houses = houses,
 			facilities = facilities,
 			house_access = houseAccess,
-			budget = _playerBudget
+			existing_roads = existingRoads,
+			budget = Mathf.Min(_playerBudget, _clinicMoney),
+			road_cost = RoadCost,
+			turn_index = _day,
+			setup_phase = !_resolveTurnAfterResponse
 		};
 	}
 
@@ -999,6 +1074,42 @@ public partial class Main : Node2D
 		GD.Print($"Optimizer response code: {responseCode}");
 		GD.Print(responseText);
 
+		if (result != (long)HttpRequest.Result.Success)
+		{
+			string message = $"Optimizer request failed: {(HttpRequest.Result)result}";
+			if (!string.IsNullOrWhiteSpace(responseText))
+				message += $" | {responseText}";
+
+			GD.PrintErr(message);
+			_statusLabel.Text = message;
+			_turnInProgress = false;
+			_endTurnButton.Disabled = _gameOver;
+			return;
+		}
+
+		if (responseCode < 200 || responseCode >= 300)
+		{
+			string message = $"Optimizer returned HTTP {responseCode}";
+			if (!string.IsNullOrWhiteSpace(responseText))
+				message += $" | {responseText}";
+
+			GD.PrintErr(message);
+			_statusLabel.Text = message;
+			_turnInProgress = false;
+			_endTurnButton.Disabled = _gameOver;
+			return;
+		}
+
+		if (string.IsNullOrWhiteSpace(responseText))
+		{
+			const string message = "Optimizer returned an empty response body.";
+			GD.PrintErr(message);
+			_statusLabel.Text = message;
+			_turnInProgress = false;
+			_endTurnButton.Disabled = _gameOver;
+			return;
+		}
+
 		SolveResponse response = null;
 		try
 		{
@@ -1006,19 +1117,30 @@ public partial class Main : Node2D
 		}
 		catch (Exception e)
 		{
-			GD.PrintErr($"Failed to parse optimizer response: {e.Message}");
+			string message = $"Failed to parse optimizer response: {e.Message}";
+			GD.PrintErr(message);
+			_statusLabel.Text = message;
+			_turnInProgress = false;
+			_endTurnButton.Disabled = _gameOver;
+			return;
 		}
+
+		int roadsBuilt = ApplyOptimizerRoads(response);
+		float roadSpendCap = roadsBuilt * RoadCost;
+		float roadSpend = Mathf.Min(response?.spent_budget ?? 0f, roadSpendCap);
 
 		UpdateFacilityPatientCounts(response);
 
 		if (_resolveTurnAfterResponse)
 		{
-			ResolveTurn(response);
+			ResolveTurn(response, roadSpend, roadsBuilt);
 			_resolveTurnAfterResponse = false;
 		}
 		else
 		{
-			_statusLabel.Text = "Initial optimization done. Build and press End Turn.";
+			_statusLabel.Text = roadsBuilt > 0
+				? $"Initial optimization done. GAMSPy built {roadsBuilt} road(s). Build and press End Turn."
+				: "Initial optimization done. Build and press End Turn.";
 		}
 
 		_turnInProgress = false;
@@ -1026,7 +1148,7 @@ public partial class Main : Node2D
 		UpdateHud();
 	}
 
-	private void ResolveTurn(SolveResponse response)
+	private void ResolveTurn(SolveResponse response, float roadSpend, int roadsBuilt)
 	{
 		_day++;
 
@@ -1035,7 +1157,10 @@ public partial class Main : Node2D
 
 		float income = clinicCount * RevenuePerPatient;
 		float upkeep = DailyClinicUpkeep + Mathf.Min(_day * DailyUpkeepGrowth, 12f);
+		_previousDayProfit = income - upkeep - roadSpend;
 
+		_playerBudget -= roadSpend;
+		_clinicMoney -= roadSpend;
 		_clinicMoney += income - upkeep;
 		_playerBudget += income;
 
@@ -1045,7 +1170,7 @@ public partial class Main : Node2D
 			return;
 
 		_statusLabel.Text =
-			$"Day {_day}: clinic patients={clinicCount}, ratio={clinicRatio:0.00}, income=${income:0.0}, upkeep=${upkeep:0.0}.";
+			$"Day {_day}: clinic patients={clinicCount}, ratio={clinicRatio:0.00}, roads built={roadsBuilt}, road spend=${roadSpend:0.0}, income=${income:0.0}, upkeep=${upkeep:0.0}.";
 	}
 
 	private int ExtractClinicCount(SolveResponse response)
@@ -1087,8 +1212,13 @@ public partial class Main : Node2D
 		_gameOver = true;
 		_endTurnButton.Disabled = true;
 		_pointerButton.Disabled = true;
-		_roadButton.Disabled = true;
-		_mallButton.Disabled = true;
+		_roadBuildButton.Disabled = true;
+		_roadDestroyButton.Disabled = true;
+		_roadUpgradeButton.Disabled = true;
+		_mallBuildButton.Disabled = true;
+		_mallDestroyButton.Disabled = true;
+		_cutHospitalFundingButton.Disabled = true;
+		_roadBlockageButton.Disabled = true;
 
 		_statusLabel.Text = $"Game Over. Clinic ran out of money. Final score: {_day} days survived.";
 		return true;
@@ -1157,16 +1287,63 @@ public partial class Main : Node2D
 		if (response.clinic_count >= 0)
 			_facilityPatientCounts["Clinic"] = response.clinic_count;
 	}
+
+	private void ShowUnavailableAction(string message)
+	{
+		_statusLabel.Text = message;
+		SetSelectedTool(BuildTool.None);
+	}
+
+	private int ApplyOptimizerRoads(SolveResponse response)
+	{
+		if (response?.built_roads == null)
+			return 0;
+
+		int applied = 0;
+		foreach (var road in response.built_roads)
+		{
+			Vector2I pos = new(road.x, road.y);
+			if (!IsBuildableRoadTile(pos))
+				continue;
+
+			PlaceStructure(pos, BuildTool.Road);
+			applied++;
+		}
+
+		return applied;
+	}
+
+	private bool IsBuildableRoadTile(Vector2I pos)
+	{
+		if (pos.X < 0 || pos.X >= GridSize || pos.Y < 0 || pos.Y >= GridSize)
+			return false;
+
+		if (_occupiedTiles.Contains(pos))
+			return false;
+
+		return !_structures.ContainsKey(pos);
+	}
 }
 
 // Request/response models
 
 public class SolveRequest
 {
-	public List<string> houses { get; set; }
+	public List<HouseData> houses { get; set; }
 	public List<FacilityData> facilities { get; set; }
 	public List<FacilityCost> house_access { get; set; }
 	public float budget { get; set; }
+	public List<GridPoint> existing_roads { get; set; }
+	public float road_cost { get; set; }
+	public int turn_index { get; set; }
+	public bool setup_phase { get; set; }
+}
+
+public class HouseData
+{
+	public string id { get; set; }
+	public int x { get; set; }
+	public int y { get; set; }
 }
 
 public class FacilityData
@@ -1184,6 +1361,12 @@ public class FacilityCost
 	public float travel_cost { get; set; }
 }
 
+public class GridPoint
+{
+	public int x { get; set; }
+	public int y { get; set; }
+}
+
 public class SolveResponse
 {
 	public Dictionary<string, string> preferred_facility { get; set; }
@@ -1193,4 +1376,6 @@ public class SolveResponse
 	public float citizen_cost_objective { get; set; }
 	public string solver_status { get; set; }
 	public float budget_seen { get; set; }
+	public float spent_budget { get; set; }
+	public List<GridPoint> built_roads { get; set; }
 }

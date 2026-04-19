@@ -1,0 +1,15 @@
+[gd_scene format=3 uid="uid://c2rtiq6xtejci"]
+
+[ext_resource type="Script" uid="uid://cytsxkaoxex8a" path="res://Main.cs" id="1_h2yge"]
+[ext_resource type="Texture2D" uid="uid://d0mbf8fhvubls" path="res://roads/roadEW.tga" id="1_ig7tw"]
+
+[node name="Node2D" type="Node2D" unique_id=878611454]
+script = ExtResource("1_h2yge")
+
+[node name="Line2D" type="Line2D" parent="." unique_id=1023495808]
+texture = ExtResource("1_ig7tw")
+texture_mode = 1
+
+[node name="Timer" type="Timer" parent="." unique_id=212706317]
+
+[node name="Camera2D" type="Camera2D" parent="." unique_id=1560264560]

@@ -24,33 +24,43 @@ public partial class Main : Node2D
 	private const int RoadS = 4;
 	private const int RoadW = 8;
 
-	private const int HospitalCount = 4;
-	private const int HouseCount = 4; // must be < hospitals + clinic
+	private const int HospitalCount = 2;
+	private const int HouseCount = 4;
 
 	private const float RoadCost = 3f;
 	private const float MallCost = 5f;
+	private const float RoadDestroyCost = 2f;
+	private const float UpgradeCost = 2f;
+	private const float BlockageCost = 4f;
+	private const float CutFundingCost = 8f;
 
-	private const float RevenuePerPatient = 10f;
-	private const float DailyClinicUpkeep = 8f;
-	private const float DailyUpkeepGrowth = 0.6f;
+	private const float RevenuePerPatient = 12f;
+	private const float DailyClinicUpkeep = 10f;
+	private const float DailyUpkeepGrowth = 0.5f;
 
 	private readonly HashSet<Vector2I> _occupiedTiles = new();
 	private readonly List<Vector2I> _hospitalPositions = new();
 	private readonly List<Vector2I> _housePositions = new();
 	private readonly Dictionary<Vector2I, BuildTool> _structures = new();
 	private readonly Dictionary<Vector2I, Control> _structureNodes = new();
+	private readonly HashSet<Vector2I> _upgradedRoads = new();
+	private readonly HashSet<Vector2I> _blockedRoads = new();
+	private readonly HashSet<Vector2I> _optimizerRoads = new(); // roads built by city
+	private readonly List<Line2D> _routeLines = new();
 
 	private Vector2I _clinicPos;
 
 	// Game state
 	private int _day = 0;
-	private float _playerBudget = 40f;
+	private float _playerBudget = 50f;
 	private float _citizenBudget = 30f;
-	private float _clinicMoney = 40f;
+	private float _clinicMoney = 50f;
 	private float _previousDayProfit = 0f;
+	private float _peakCoverage = 0f;
+	private float _totalRevenue = 0f;
 
-	private float _citizenHospitalBonus = 0f; // lowers hospital cost over time
-	private float _citizenClinicPenalty = 0f; // raises clinic cost over time
+	private bool _hospitalFundingCutActive = false;
+	private bool _fundingCutUsedThisTurn = false;
 
 	private bool _turnInProgress = false;
 	private bool _resolveTurnAfterResponse = false;
@@ -59,16 +69,20 @@ public partial class Main : Node2D
 	private Vector2I _lastHoveredTile = new(-1, -1);
 	private float _hoverTimer = 0f;
 
-	// HUD
+	// HUD nodes
 	private Label _dayLabel;
 	private Label _playerBudgetLabel;
 	private Label _optimizerBudgetLabel;
 	private Label _previousProfitLabel;
+	private Label _coverageLabel;
 	private Label _toolLabel;
 	private Label _statusLabel;
-	private Label _hoverLabel;
+	private PanelContainer _hoverTooltip;
+	private Label _hoverTooltipLabel;
 	private PanelContainer _infoPanel;
 	private PanelContainer _actionsPanel;
+	private ColorRect _clinicHealthBar;
+	private ColorRect _clinicHealthBarBg;
 
 	private Button _pointerButton;
 	private Button _roadBuildButton;
@@ -86,9 +100,16 @@ public partial class Main : Node2D
 	{
 		None,
 		Road,
-		Mall
+		RoadDestroy,
+		RoadUpgrade,
+		Mall,
+		MallDestroy,
+		RoadBlockage,
 	}
 
+	// -------------------------------------------------------------------------
+	// _Ready
+	// -------------------------------------------------------------------------
 	public override void _Ready()
 	{
 		_camera = GetNode<Camera2D>("Camera2D");
@@ -101,7 +122,7 @@ public partial class Main : Node2D
 		_http.RequestCompleted += OnRequestCompleted;
 
 		// Ocean background outside island/map.
-		RenderingServer.SetDefaultClearColor(new Color(0.12f, 0.45f, 0.85f));
+		RenderingServer.SetDefaultClearColor(new Color(0.08f, 0.35f, 0.65f));
 
 		GenerateGrid();
 		CreateHud();
@@ -117,14 +138,15 @@ public partial class Main : Node2D
 		UpdateHoverStats(delta);
 	}
 
+	// -------------------------------------------------------------------------
+	// Hover tooltip — floats over the tile in world space
+	// -------------------------------------------------------------------------
 	private void UpdateHoverStats(double delta)
 	{
-		if (_hoverLabel == null) return;
-
-		// Ignore map placement when cursor is over HUD controls.
+		if (_hoverTooltip == null) return;
 		if (GetViewport().GuiGetHoveredControl() != null)
 		{
-			_hoverLabel.Text = "";
+			_hoverTooltip.Visible = false;
 			_hoverTimer = 0f;
 			return;
 		}
@@ -137,7 +159,7 @@ public partial class Main : Node2D
 
 		if (gridPos.X < 0 || gridPos.X >= GridSize || gridPos.Y < 0 || gridPos.Y >= GridSize)
 		{
-			_hoverLabel.Text = "";
+			_hoverTooltip.Visible = false;
 			_hoverTimer = 0f;
 			return;
 		}
@@ -150,72 +172,99 @@ public partial class Main : Node2D
 		{
 			_lastHoveredTile = gridPos;
 			_hoverTimer = 0f;
-			_hoverLabel.Text = "";
+			_hoverTooltip.Visible = false;
 		}
 
-		if (_hoverTimer >= 1.0f)
+		if (_hoverTimer >= 0.4f)
 		{
-			if (_structures.TryGetValue(gridPos, out var structure))
+			string text = GetTileTooltipText(gridPos);
+			if (string.IsNullOrEmpty(text))
 			{
-				if (structure == BuildTool.Road)
-				{
-					float congestion = GetRoadCongestionValue(gridPos);
-					_hoverLabel.Text = $"Road ({gridPos.X},{gridPos.Y}) | Congestion: {congestion:0.0}";
-				}
-				else if (structure == BuildTool.Mall)
-				{
-					float caused = GetMallCongestionCaused(gridPos);
-					_hoverLabel.Text = $"Mall ({gridPos.X},{gridPos.Y}) | Added Congestion: +{caused:0.0}";
-				}
+				_hoverTooltip.Visible = false;
 				return;
 			}
 
-			int hospitalIdx = _hospitalPositions.IndexOf(gridPos);
-			if (hospitalIdx >= 0)
-			{
-				string facilityId = $"Hospital_{hospitalIdx}";
-				int patients = GetFacilityPatients(facilityId);
-				float revenue = patients * RevenuePerPatient;
-				_hoverLabel.Text = $"Hospital {hospitalIdx} | Patients: {patients} | Revenue: ${revenue:0.0}";
-				return;
-			}
+			_hoverTooltipLabel.Text = text;
+			_hoverTooltip.Visible = true;
 
-			if (gridPos == _clinicPos)
-			{
-				int patients = GetFacilityPatients("Clinic");
-				float revenue = patients * RevenuePerPatient;
-				_hoverLabel.Text = $"Clinic | Patients: {patients} | Revenue: ${revenue:0.0}";
-				return;
-			}
-
-			_hoverLabel.Text = ""; // Grass tile or generic entity
+			// Position the tooltip above the tile in world space
+			Vector2 tileWorldPos = new Vector2(gridPos.X * TileSpacing, gridPos.Y * TileSpacing);
+			_hoverTooltip.Position = tileWorldPos + new Vector2(TileSpacing * 0.5f - 80f, -50f);
 		}
+	}
+
+	private string GetTileTooltipText(Vector2I gridPos)
+	{
+		if (_structures.TryGetValue(gridPos, out var structure))
+		{
+			if (structure == BuildTool.Road)
+			{
+				float congestion = GetRoadCongestionValue(gridPos);
+				bool upgraded = _upgradedRoads.Contains(gridPos);
+				bool blocked = _blockedRoads.Contains(gridPos);
+				bool isOptimizerRoad = _optimizerRoads.Contains(gridPos);
+				string flags = "";
+				if (upgraded) flags += " [UPGRADED]";
+				if (blocked) flags += " [BLOCKED]";
+				if (isOptimizerRoad) flags += " [CITY]";
+				return $"Road{flags}\nCongestion: {congestion:0.00}";
+			}
+			if (structure == BuildTool.Mall)
+			{
+				float caused = GetMallCongestionCaused(gridPos);
+				return $"Mall\n+{caused:0.0} congestion";
+			}
+		}
+
+		int hospitalIdx = _hospitalPositions.IndexOf(gridPos);
+		if (hospitalIdx >= 0)
+		{
+			int patients = GetFacilityPatients($"Hospital_{hospitalIdx}");
+			return $"Hospital {hospitalIdx}\nPatients: {patients}";
+		}
+
+		if (gridPos == _clinicPos)
+		{
+			int patients = GetFacilityPatients("Clinic");
+			float revenue = patients * RevenuePerPatient;
+			return $"Uncle's Clinic ⭐\nPatients: {patients} | ${revenue:0.0}";
+		}
+
+		int houseIdx = _housePositions.IndexOf(gridPos);
+		if (houseIdx >= 0)
+		{
+			string preferred = GetFacilityForHouse($"House_{houseIdx}");
+			return $"House {houseIdx} 🏠\nPrefers: {preferred}";
+		}
+
+		return null;
+	}
+
+	private string GetFacilityForHouse(string houseId)
+	{
+		// Try to find from last response cached in patient counts (not ideal, but workable)
+		return "unknown";
 	}
 
 	private float GetRoadCongestionValue(Vector2I roadPos)
 	{
-		float baseCongestion = ((roadPos.X * 3 + roadPos.Y) % 5) * 0.4f;
 		float mallImpact = 0f;
-
 		foreach (var kv in _structures)
 		{
 			if (kv.Value == BuildTool.Mall && Manhattan(kv.Key, roadPos) <= 1)
 				mallImpact += 1.4f;
 		}
-
-		return baseCongestion + mallImpact;
+		return mallImpact;
 	}
 
 	private float GetMallCongestionCaused(Vector2I mallPos)
 	{
 		int affectedRoads = 0;
-
 		foreach (var kv in _structures)
 		{
 			if (kv.Value == BuildTool.Road && Manhattan(kv.Key, mallPos) <= 1)
 				affectedRoads++;
 		}
-
 		return affectedRoads * 1.4f;
 	}
 
@@ -224,6 +273,9 @@ public partial class Main : Node2D
 		return _facilityPatientCounts.TryGetValue(facilityId, out var count) ? count : 0;
 	}
 
+	// -------------------------------------------------------------------------
+	// Map generation
+	// -------------------------------------------------------------------------
 	private void GenerateGrid()
 	{
 		_occupiedTiles.Clear();
@@ -231,47 +283,52 @@ public partial class Main : Node2D
 		_housePositions.Clear();
 		_structures.Clear();
 		_structureNodes.Clear();
+		_upgradedRoads.Clear();
+		_blockedRoads.Clear();
+		_optimizerRoads.Clear();
 
 		var rng = new RandomNumberGenerator();
 		rng.Randomize();
 
-		// Ground (island)
+		// Ground tiles
 		for (int x = 0; x < GridSize; x++)
 		{
 			for (int y = 0; y < GridSize; y++)
 			{
-				Color groundColor = rng.Randf() < 0.10f
-					? new Color(0.35f, 0.35f, 0.35f)
-					: new Color(0.2f, 0.55f, 0.25f);
-
+				// Subtle variation: slightly different green shades
+				float shade = 0.47f + (((x * 7 + y * 3) % 8) * 0.012f);
+				Color groundColor = rng.Randf() < 0.08f
+					? new Color(0.3f, 0.3f, 0.3f)   // rocky patch
+					: new Color(0.18f, shade, 0.22f);
 				PlaceTile(new Vector2I(x, y), groundColor, $"Tile_{x}_{y}");
 			}
 		}
 
-		// Clinic
+		// Clinic — center
 		_clinicPos = new Vector2I(GridSize / 2, GridSize / 2);
-		PlaceEntity(_clinicPos, new Color(0.8f, 0.6f, 0.2f), "🌟", "Clinic");
+		PlaceEntity(_clinicPos, new Color(0.85f, 0.65f, 0.1f), "⭐", "Clinic");
 		_occupiedTiles.Add(_clinicPos);
 
-		// Hospitals (kept away from clinic)
+		// Hospitals — kept away from clinic
 		PlaceRandomEntities(
 			rng,
 			count: HospitalCount,
-			minDist: 10f,
+			minDist: 8f,
 			exclusions: new List<Vector2I> { _clinicPos },
-			col: new Color(0.8f, 0.2f, 0.2f),
+			col: new Color(0.75f, 0.18f, 0.18f),
 			emoji: "🏥",
 			prefix: "Hospital",
 			storeList: _hospitalPositions
 		);
 
-		// Houses (kept away from hospitals)
+		// Houses — kept away from hospitals and clinic
+		var houseExclusions = new List<Vector2I>(_hospitalPositions) { _clinicPos };
 		PlaceRandomEntities(
 			rng,
 			count: HouseCount,
-			minDist: 4f,
-			exclusions: _hospitalPositions,
-			col: new Color(0.2f, 0.4f, 0.8f),
+			minDist: 3f,
+			exclusions: houseExclusions,
+			col: new Color(0.2f, 0.38f, 0.75f),
 			emoji: "🏠",
 			prefix: "House",
 			storeList: _housePositions
@@ -292,7 +349,7 @@ public partial class Main : Node2D
 		int placed = 0;
 		int attempts = 0;
 
-		while (placed < count && attempts < 1000)
+		while (placed < count && attempts < 2000)
 		{
 			attempts++;
 			Vector2I pos = new(
@@ -338,7 +395,6 @@ public partial class Main : Node2D
 			MouseFilter = Control.MouseFilterEnum.Ignore,
 			ZIndex = 0
 		};
-
 		AddChild(rect);
 	}
 
@@ -367,17 +423,26 @@ public partial class Main : Node2D
 		AddChild(rect);
 	}
 
-	private void PlaceStructure(Vector2I gridPos, BuildTool tool)
+	// -------------------------------------------------------------------------
+	// Structure placement / removal
+	// -------------------------------------------------------------------------
+	private void PlaceStructure(Vector2I gridPos, BuildTool tool, bool animated = false, bool isOptimizerRoad = false)
 	{
 		_structures[gridPos] = tool;
 
 		if (tool == BuildTool.Road)
 		{
+			if (isOptimizerRoad)
+				_optimizerRoads.Add(gridPos);
+
 			RefreshRoadAt(gridPos);
 			RefreshRoadAt(new Vector2I(gridPos.X, gridPos.Y - 1));
 			RefreshRoadAt(new Vector2I(gridPos.X + 1, gridPos.Y));
 			RefreshRoadAt(new Vector2I(gridPos.X, gridPos.Y + 1));
 			RefreshRoadAt(new Vector2I(gridPos.X - 1, gridPos.Y));
+
+			if (animated && _structureNodes.TryGetValue(gridPos, out var roadNode))
+				AnimatePlacement(roadNode);
 			return;
 		}
 
@@ -387,7 +452,7 @@ public partial class Main : Node2D
 		{
 			Size = new Vector2(TileSpacing - 14, TileSpacing - 14),
 			Position = new Vector2(gridPos.X * TileSpacing + 6, gridPos.Y * TileSpacing + 6),
-			Color = new Color(0.75f, 0.4f, 0.15f, 0.95f),
+			Color = new Color(0.72f, 0.38f, 0.12f, 0.95f),
 			Name = $"Structure_{gridPos.X}_{gridPos.Y}",
 			ZIndex = 2,
 			MouseFilter = Control.MouseFilterEnum.Ignore
@@ -405,8 +470,104 @@ public partial class Main : Node2D
 		rect.AddChild(label);
 		AddChild(rect);
 		_structureNodes[gridPos] = rect;
+
+		if (animated)
+			AnimatePlacement(rect);
 	}
 
+	private void DestroyStructureAt(Vector2I gridPos, bool animated = false)
+	{
+		if (!_structures.ContainsKey(gridPos)) return;
+
+		bool wasRoad = _structures[gridPos] == BuildTool.Road;
+		_structures.Remove(gridPos);
+		_upgradedRoads.Remove(gridPos);
+		_blockedRoads.Remove(gridPos);
+		_optimizerRoads.Remove(gridPos);
+
+		if (animated && _structureNodes.TryGetValue(gridPos, out var node))
+		{
+			AnimateDestroy(node, () =>
+			{
+				_structureNodes.Remove(gridPos);
+				if (wasRoad)
+				{
+					RefreshRoadNeighbors(gridPos);
+				}
+			});
+		}
+		else
+		{
+			RemoveStructureNode(gridPos);
+			if (wasRoad)
+				RefreshRoadNeighbors(gridPos);
+		}
+	}
+
+	private void RefreshRoadNeighbors(Vector2I gridPos)
+	{
+		RefreshRoadAt(new Vector2I(gridPos.X, gridPos.Y - 1));
+		RefreshRoadAt(new Vector2I(gridPos.X + 1, gridPos.Y));
+		RefreshRoadAt(new Vector2I(gridPos.X, gridPos.Y + 1));
+		RefreshRoadAt(new Vector2I(gridPos.X - 1, gridPos.Y));
+	}
+
+	// -------------------------------------------------------------------------
+	// Animations
+	// -------------------------------------------------------------------------
+	private void AnimatePlacement(Control node)
+	{
+		if (node == null) return;
+		node.PivotOffset = node.Size * 0.5f;
+		node.Scale = new Vector2(0.1f, 0.1f);
+		node.Modulate = new Color(1f, 1f, 1f, 0f);
+
+		var tween = CreateTween();
+		tween.SetParallel(true);
+		tween.TweenProperty(node, "scale", Vector2.One, 0.25f).SetTrans(Tween.TransitionType.Back).SetEase(Tween.EaseType.Out);
+		tween.TweenProperty(node, "modulate", new Color(1f, 1f, 1f, 1f), 0.15f);
+	}
+
+	private void AnimateDestroy(Control node, Action onComplete)
+	{
+		if (node == null) { onComplete?.Invoke(); return; }
+		node.PivotOffset = node.Size * 0.5f;
+		var tween = CreateTween();
+		tween.SetParallel(true);
+		tween.TweenProperty(node, "scale", new Vector2(0.05f, 0.05f), 0.2f).SetTrans(Tween.TransitionType.Back).SetEase(Tween.EaseType.In);
+		tween.TweenProperty(node, "modulate", new Color(1f, 0.3f, 0.3f, 0f), 0.2f);
+		tween.Chain();
+		tween.TweenCallback(Callable.From(() =>
+		{
+			node.QueueFree();
+			onComplete?.Invoke();
+		}));
+	}
+
+	private void AnimateUpgrade(Control node)
+	{
+		if (node == null) return;
+		node.PivotOffset = node.Size * 0.5f;
+		var tween = CreateTween();
+		// Flash green
+		tween.TweenProperty(node, "modulate", new Color(0.4f, 1f, 0.5f, 1f), 0.12f);
+		tween.TweenProperty(node, "modulate", Colors.White, 0.12f);
+		tween.TweenProperty(node, "modulate", new Color(0.4f, 1f, 0.5f, 1f), 0.12f);
+		tween.TweenProperty(node, "modulate", Colors.White, 0.12f);
+	}
+
+	private void AnimateBlock(Control node)
+	{
+		if (node == null) return;
+		node.PivotOffset = node.Size * 0.5f;
+		var tween = CreateTween();
+		tween.TweenProperty(node, "modulate", new Color(1f, 0.8f, 0.2f, 1f), 0.15f);
+		tween.TweenProperty(node, "modulate", Colors.White, 0.15f);
+	}
+
+	// -------------------------------------------------------------------------
+	// Road rendering
+	// -------------------------------------------------------------------------
 	private void LoadRoadTextures()
 	{
 		_roadTextures.Clear();
@@ -429,22 +590,17 @@ public partial class Main : Node2D
 		while (true)
 		{
 			string file = dir.GetNext();
-			if (string.IsNullOrEmpty(file))
-				break;
-			if (dir.CurrentIsDir())
-				continue;
-			if (!file.StartsWith("road", StringComparison.OrdinalIgnoreCase))
-				continue;
+			if (string.IsNullOrEmpty(file)) break;
+			if (dir.CurrentIsDir()) continue;
+			if (!file.StartsWith("road", StringComparison.OrdinalIgnoreCase)) continue;
 
 			string ext = Path.GetExtension(file).ToLowerInvariant();
-			if (ext != ".tga" && ext != ".png" && ext != ".webp")
-				continue;
+			if (ext != ".tga" && ext != ".png" && ext != ".webp") continue;
 
 			string nameNoExt = Path.GetFileNameWithoutExtension(file);
 			string suffix = nameNoExt.Length > 4 ? nameNoExt.Substring(4) : string.Empty;
 			string key = NormalizeRoadKey(suffix);
-			if (string.IsNullOrEmpty(key))
-				continue;
+			if (string.IsNullOrEmpty(key)) continue;
 
 			var tex = GD.Load<Texture2D>($"res://roads/{file}");
 			if (tex != null)
@@ -455,9 +611,7 @@ public partial class Main : Node2D
 
 	private static Texture2D ToSingleTileTexture(Texture2D texture)
 	{
-		if (texture == null)
-			return null;
-
+		if (texture == null) return null;
 		Vector2 size = texture.GetSize();
 		int w = Mathf.RoundToInt(size.X);
 		int h = Mathf.RoundToInt(size.Y);
@@ -483,13 +637,9 @@ public partial class Main : Node2D
 
 	private static string NormalizeRoadKey(string raw)
 	{
-		if (string.IsNullOrWhiteSpace(raw))
-			return string.Empty;
-
+		if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
 		bool n = false, e = false, s = false, w = false;
 		string upper = raw.Trim().ToUpperInvariant();
-
-		// tokenize by non-letters/non-digits
 		var token = new StringBuilder();
 		void FlushToken()
 		{
@@ -497,26 +647,18 @@ public partial class Main : Node2D
 			ApplyRoadToken(token.ToString(), ref n, ref e, ref s, ref w);
 			token.Clear();
 		}
-
 		foreach (char c in upper)
 		{
-			if (char.IsLetterOrDigit(c))
-				token.Append(c);
-			else
-				FlushToken();
+			if (char.IsLetterOrDigit(c)) token.Append(c);
+			else FlushToken();
 		}
 		FlushToken();
 
-		// fallback: only if entire raw is made of NESW letters (prevents "CROSS" => "S")
 		bool onlyDirs = true;
 		foreach (char c in upper)
 		{
 			if (c == '_' || c == '-' || c == ' ') continue;
-			if (c is not ('N' or 'E' or 'S' or 'W'))
-			{
-				onlyDirs = false;
-				break;
-			}
+			if (c is not ('N' or 'E' or 'S' or 'W')) { onlyDirs = false; break; }
 		}
 		if (!n && !e && !s && !w && onlyDirs)
 		{
@@ -541,35 +683,14 @@ public partial class Main : Node2D
 	{
 		switch (t)
 		{
-			case "N":
-			case "NORTH": n = true; return;
-			case "E":
-			case "EAST": e = true; return;
-			case "S":
-			case "SOUTH": s = true; return;
-			case "W":
-			case "WEST": w = true; return;
-
-			case "NS":
-			case "SN":
-			case "V":
-			case "VERT":
-			case "VERTICAL": n = s = true; return;
-
-			case "EW":
-			case "WE":
-			case "H":
-			case "HOR":
-			case "HORIZONTAL": e = w = true; return;
-
-			case "NESW":
-			case "CROSS":
-			case "X":
-			case "PLUS":
-			case "INTERSECTION": n = e = s = w = true; return;
+			case "N": case "NORTH": n = true; return;
+			case "E": case "EAST": e = true; return;
+			case "S": case "SOUTH": s = true; return;
+			case "W": case "WEST": w = true; return;
+			case "NS": case "SN": case "V": case "VERT": case "VERTICAL": n = s = true; return;
+			case "EW": case "WE": case "H": case "HOR": case "HORIZONTAL": e = w = true; return;
+			case "NESW": case "CROSS": case "X": case "PLUS": case "INTERSECTION": n = e = s = w = true; return;
 		}
-
-		// direction combos in one token: NE, EN, T_NES-like compact forms
 		foreach (char c in t)
 		{
 			if (c == 'N') n = true;
@@ -587,6 +708,7 @@ public partial class Main : Node2D
 		RemoveStructureNode(gridPos);
 		int mask = GetRoadMask(gridPos);
 
+		Control roadNode;
 		if (TryGetRoadTexture(mask, out var tex, out float rotation))
 		{
 			var road = new TextureRect
@@ -599,21 +721,28 @@ public partial class Main : Node2D
 				ZIndex = 2,
 				MouseFilter = Control.MouseFilterEnum.Ignore
 			};
-
 			if (!Mathf.IsZeroApprox(rotation))
 			{
 				road.PivotOffset = road.Size * 0.5f;
 				road.Rotation = rotation;
 			}
-
-			AddChild(road);
-			_structureNodes[gridPos] = road;
-			return;
+			roadNode = road;
+		}
+		else
+		{
+			roadNode = CreateConnectedRoadFallback(gridPos, mask);
 		}
 
-		var fallback = CreateConnectedRoadFallback(gridPos, mask);
-		AddChild(fallback);
-		_structureNodes[gridPos] = fallback;
+		// Tint: optimizer roads are slightly blue, upgraded roads are slightly green
+		if (_optimizerRoads.Contains(gridPos))
+			roadNode.Modulate = new Color(0.7f, 0.85f, 1f);
+		else if (_upgradedRoads.Contains(gridPos))
+			roadNode.Modulate = new Color(0.75f, 1f, 0.75f);
+		else if (_blockedRoads.Contains(gridPos))
+			roadNode.Modulate = new Color(1f, 0.6f, 0.2f);
+
+		AddChild(roadNode);
+		_structureNodes[gridPos] = roadNode;
 	}
 
 	private void RemoveStructureNode(Vector2I gridPos)
@@ -635,10 +764,8 @@ public partial class Main : Node2D
 		return mask;
 	}
 
-	private bool IsRoadAt(Vector2I p)
-	{
-		return _structures.TryGetValue(p, out var t) && t == BuildTool.Road;
-	}
+	private bool IsRoadAt(Vector2I p) =>
+		_structures.TryGetValue(p, out var t) && t == BuildTool.Road;
 
 	private static string MaskToRoadKey(int mask)
 	{
@@ -654,20 +781,14 @@ public partial class Main : Node2D
 	{
 		texture = null;
 		rotation = 0f;
-
 		string key = MaskToRoadKey(mask);
-		if (_roadTextures.TryGetValue(key, out texture))
-			return true;
-
+		if (_roadTextures.TryGetValue(key, out texture)) return true;
 		if ((key == "NS" || key == "N" || key == "S") && _roadTextures.TryGetValue("EW", out texture))
 		{
 			rotation = Mathf.Pi * 0.5f;
 			return true;
 		}
-
-		if ((key == "E" || key == "W") && _roadTextures.TryGetValue("EW", out texture))
-			return true;
-
+		if ((key == "E" || key == "W") && _roadTextures.TryGetValue("EW", out texture)) return true;
 		return false;
 	}
 
@@ -692,7 +813,6 @@ public partial class Main : Node2D
 		if ((mask & RoadE) != 0) AddRoadPart(root, new Rect2(center + thickness - 1f, center, size - (center + thickness - 1f), thickness));
 		if ((mask & RoadS) != 0) AddRoadPart(root, new Rect2(center, center + thickness - 1f, thickness, size - (center + thickness - 1f)));
 		if ((mask & RoadW) != 0) AddRoadPart(root, new Rect2(0, center, center + 1f, thickness));
-
 		return root;
 	}
 
@@ -710,7 +830,6 @@ public partial class Main : Node2D
 			});
 			return;
 		}
-
 		parent.AddChild(new ColorRect
 		{
 			Position = rect.Position,
@@ -720,15 +839,79 @@ public partial class Main : Node2D
 		});
 	}
 
+	// -------------------------------------------------------------------------
+	// Route visualization
+	// -------------------------------------------------------------------------
+	private void DrawRouteLines(Dictionary<string, string> preferredFacility)
+	{
+		// Clear old lines
+		foreach (var line in _routeLines)
+			line.QueueFree();
+		_routeLines.Clear();
+
+		if (preferredFacility == null) return;
+
+		for (int i = 0; i < _housePositions.Count; i++)
+		{
+			string houseId = $"House_{i}";
+			if (!preferredFacility.TryGetValue(houseId, out string facilityId)) continue;
+
+			Vector2I houseGrid = _housePositions[i];
+			Vector2I facilityGrid;
+
+			if (facilityId == "Clinic")
+			{
+				facilityGrid = _clinicPos;
+			}
+			else
+			{
+				int hIdx = int.Parse(facilityId.Replace("Hospital_", ""));
+				if (hIdx < 0 || hIdx >= _hospitalPositions.Count) continue;
+				facilityGrid = _hospitalPositions[hIdx];
+			}
+
+			bool toClinic = facilityId == "Clinic";
+
+			var line = new Line2D
+			{
+				Width = 3f,
+				DefaultColor = toClinic
+					? new Color(0.2f, 0.9f, 0.3f, 0.7f)     // green → clinic
+					: new Color(0.9f, 0.2f, 0.2f, 0.55f),    // red → hospital
+				ZIndex = 3,
+				Name = $"RouteLine_{i}",
+				Antialiased = true
+			};
+
+			Vector2 from = TileCenter(houseGrid);
+			Vector2 to = TileCenter(facilityGrid);
+			line.AddPoint(from);
+			line.AddPoint(to);
+			AddChild(line);
+			_routeLines.Add(line);
+		}
+	}
+
+	private Vector2 TileCenter(Vector2I gridPos)
+	{
+		return new Vector2(
+			gridPos.X * TileSpacing + TileSpacing * 0.5f,
+			gridPos.Y * TileSpacing + TileSpacing * 0.5f
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// HUD creation
+	// -------------------------------------------------------------------------
 	private void CreateHud()
 	{
-		var layer = new CanvasLayer();
-		layer.Name = "HUDLayer";
+		var layer = new CanvasLayer { Name = "HUDLayer" };
 		AddChild(layer);
 
+		// --- Info panel (top-right) ---
 		_infoPanel = new PanelContainer
 		{
-			CustomMinimumSize = new Vector2(320, 140)
+			CustomMinimumSize = new Vector2(340, 160)
 		};
 		layer.AddChild(_infoPanel);
 
@@ -739,140 +922,231 @@ public partial class Main : Node2D
 		_playerBudgetLabel = new Label();
 		_optimizerBudgetLabel = new Label();
 		_previousProfitLabel = new Label();
-		_toolLabel = new Label();
-		_statusLabel = new Label { CustomMinimumSize = new Vector2(360, 56) };
-		_statusLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
-		_hoverLabel = new Label { CustomMinimumSize = new Vector2(360, 40) };
-		_hoverLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+		_coverageLabel = new Label();
+
+		// Health bar for clinic money
+		var healthBarContainer = new HBoxContainer();
+		healthBarContainer.AddChild(new Label { Text = "Clinic $:", CustomMinimumSize = new Vector2(72, 0) });
+		_clinicHealthBarBg = new ColorRect
+		{
+			CustomMinimumSize = new Vector2(160, 16),
+			Color = new Color(0.2f, 0.2f, 0.2f)
+		};
+		_clinicHealthBar = new ColorRect
+		{
+			CustomMinimumSize = new Vector2(160, 16),
+			Color = new Color(0.2f, 0.8f, 0.3f),
+			Size = new Vector2(160, 16),
+			Position = Vector2.Zero
+		};
+		// Stack bar on top of bg using a Control
+		var barStack = new Control { CustomMinimumSize = new Vector2(160, 16) };
+		barStack.AddChild(_clinicHealthBarBg);
+		barStack.AddChild(_clinicHealthBar);
+		_clinicHealthBarBg.Size = new Vector2(160, 16);
+		healthBarContainer.AddChild(barStack);
 
 		infoRoot.AddChild(_dayLabel);
 		infoRoot.AddChild(_playerBudgetLabel);
 		infoRoot.AddChild(_optimizerBudgetLabel);
 		infoRoot.AddChild(_previousProfitLabel);
+		infoRoot.AddChild(_coverageLabel);
+		infoRoot.AddChild(healthBarContainer);
 
+		// --- Actions panel (bottom-left) ---
 		_actionsPanel = new PanelContainer
 		{
-			CustomMinimumSize = new Vector2(360, 300)
+			CustomMinimumSize = new Vector2(370, 320)
 		};
 		layer.AddChild(_actionsPanel);
 
 		var actionsRoot = new VBoxContainer();
 		_actionsPanel.AddChild(actionsRoot);
 
-		actionsRoot.AddChild(new Label { Text = "Actions" });
-
-		_pointerButton = new Button { Text = "Pointer", ToggleMode = true };
-		_pointerButton.Pressed += () => SetSelectedTool(BuildTool.None);
-		actionsRoot.AddChild(_pointerButton);
-
-		actionsRoot.AddChild(new Label { Text = "Road Management" });
-		_roadBuildButton = new Button { Text = $"Build Road (${RoadCost:0})", ToggleMode = true };
-		_roadDestroyButton = new Button { Text = "Destroy Road" };
-		_roadUpgradeButton = new Button { Text = "Upgrade Road" };
+		actionsRoot.AddChild(MakeLabel("🛠  Road Management", bold: true));
+		_roadBuildButton = MakeButton($"🔨 Build Road (${RoadCost:0})");
+		_roadDestroyButton = MakeButton($"🗑 Destroy Road (${RoadDestroyCost:0})");
+		_roadUpgradeButton = MakeButton($"⬆ Upgrade Road (${UpgradeCost:0})");
 		_roadBuildButton.Pressed += () => SetSelectedTool(BuildTool.Road);
-		_roadDestroyButton.Pressed += () => ShowUnavailableAction("Road destroy is not implemented yet.");
-		_roadUpgradeButton.Pressed += () => ShowUnavailableAction("Road upgrade is not implemented yet.");
+		_roadDestroyButton.Pressed += () => SetSelectedTool(BuildTool.RoadDestroy);
+		_roadUpgradeButton.Pressed += () => SetSelectedTool(BuildTool.RoadUpgrade);
 		actionsRoot.AddChild(_roadBuildButton);
 		actionsRoot.AddChild(_roadDestroyButton);
 		actionsRoot.AddChild(_roadUpgradeButton);
 
-		actionsRoot.AddChild(new Label { Text = "Infrastructure" });
-		_mallBuildButton = new Button { Text = $"Build Mall (${MallCost:0})", ToggleMode = true };
-		_mallDestroyButton = new Button { Text = "Destroy Mall" };
+		actionsRoot.AddChild(MakeLabel("🏪  Infrastructure", bold: true));
+		_mallBuildButton = MakeButton($"🛍 Build Mall (${MallCost:0}) [adds congestion]");
+		_mallDestroyButton = MakeButton("🗑 Destroy Mall");
 		_mallBuildButton.Pressed += () => SetSelectedTool(BuildTool.Mall);
-		_mallDestroyButton.Pressed += () => ShowUnavailableAction("Mall destroy is not implemented yet.");
+		_mallDestroyButton.Pressed += () => SetSelectedTool(BuildTool.MallDestroy);
 		actionsRoot.AddChild(_mallBuildButton);
 		actionsRoot.AddChild(_mallDestroyButton);
 
-		actionsRoot.AddChild(new Label { Text = "Temporary Actions" });
-		_cutHospitalFundingButton = new Button { Text = "Cut Hospital Funding" };
-		_roadBlockageButton = new Button { Text = "Road Blockage" };
-		_cutHospitalFundingButton.Pressed += () => ShowUnavailableAction("Cut Hospital Funding is not implemented yet.");
-		_roadBlockageButton.Pressed += () => ShowUnavailableAction("Road Blockage is not implemented yet.");
+		actionsRoot.AddChild(MakeLabel("⚡  Special Powers", bold: true));
+		_cutHospitalFundingButton = MakeButton($"✂ Cut Hospital Funding (${CutFundingCost:0})");
+		_roadBlockageButton = MakeButton($"🚧 Road Blockage (${BlockageCost:0})");
+		_cutHospitalFundingButton.Pressed += TryCutHospitalFunding;
+		_roadBlockageButton.Pressed += () => SetSelectedTool(BuildTool.RoadBlockage);
 		actionsRoot.AddChild(_cutHospitalFundingButton);
 		actionsRoot.AddChild(_roadBlockageButton);
 
+		_toolLabel = new Label { Text = "Selected: Pointer" };
 		actionsRoot.AddChild(_toolLabel);
 
-		_endTurnButton = new Button { Text = "End Turn (Send to GAMSPy)" };
+		_statusLabel = new Label { CustomMinimumSize = new Vector2(370, 56) };
+		_statusLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+		actionsRoot.AddChild(_statusLabel);
+
+		// Floating tooltip in world space (child of scene, not HUD layer)
+		_hoverTooltip = new PanelContainer
+		{
+			Visible = false,
+			ZIndex = 50,
+			MouseFilter = Control.MouseFilterEnum.Ignore,
+		};
+		_hoverTooltipLabel = new Label
+		{
+			CustomMinimumSize = new Vector2(160, 0),
+			AutowrapMode = TextServer.AutowrapMode.WordSmart,
+		};
+		_hoverTooltipLabel.AddThemeFontSizeOverride("font_size", 11);
+		_hoverTooltip.AddChild(_hoverTooltipLabel);
+		AddChild(_hoverTooltip); // world-space child, NOT on CanvasLayer
+
+		_endTurnButton = MakeButton("⏭  End Turn");
 		_endTurnButton.Pressed += EndTurn;
 		actionsRoot.AddChild(_endTurnButton);
 
-		actionsRoot.AddChild(_statusLabel);
-		actionsRoot.AddChild(_hoverLabel);
+		// Pointer button (hidden, used for deselect)
+		_pointerButton = new Button { Visible = false, ToggleMode = true };
+		_pointerButton.Pressed += () => SetSelectedTool(BuildTool.None);
+		layer.AddChild(_pointerButton);
 
 		UpdateHudLayout();
 	}
 
+	private static Label MakeLabel(string text, bool bold = false)
+	{
+		var lbl = new Label { Text = text };
+		if (bold) lbl.AddThemeFontSizeOverride("font_size", 14);
+		return lbl;
+	}
+
+	private static Button MakeButton(string text)
+	{
+		return new Button
+		{
+			Text = text,
+			ToggleMode = true,
+			CustomMinimumSize = new Vector2(0, 28)
+		};
+	}
+
 	private void UpdateHudLayout()
 	{
-		if (_infoPanel == null || _actionsPanel == null)
-			return;
+		if (_infoPanel == null || _actionsPanel == null) return;
 
-		float viewportWidth = GetViewportRect().Size.X;
-		float infoWidth = _infoPanel.Size.X > 0f
-			? _infoPanel.Size.X
-			: _infoPanel.CustomMinimumSize.X;
+		float vw = GetViewportRect().Size.X;
+		float infoW = _infoPanel.Size.X > 0f ? _infoPanel.Size.X : _infoPanel.CustomMinimumSize.X;
+		_infoPanel.Position = new Vector2(vw - infoW - 12f, 12f);
 
-		_infoPanel.Position = new Vector2(viewportWidth - infoWidth - 12f, 12f);
-
-		float viewportHeight = GetViewportRect().Size.Y;
-		float actionsHeight = _actionsPanel.Size.Y > 0f
-			? _actionsPanel.Size.Y
-			: _actionsPanel.CustomMinimumSize.Y;
-
-		_actionsPanel.Position = new Vector2(12, viewportHeight - actionsHeight - 12f);
+		float vh = GetViewportRect().Size.Y;
+		float actH = _actionsPanel.Size.Y > 0f ? _actionsPanel.Size.Y : _actionsPanel.CustomMinimumSize.Y;
+		_actionsPanel.Position = new Vector2(12f, vh - actH - 12f);
 	}
 
 	private void SetSelectedTool(BuildTool tool)
 	{
 		_selectedTool = tool;
-
-		_pointerButton.ButtonPressed = tool == BuildTool.None;
 		_roadBuildButton.ButtonPressed = tool == BuildTool.Road;
+		_roadDestroyButton.ButtonPressed = tool == BuildTool.RoadDestroy;
+		_roadUpgradeButton.ButtonPressed = tool == BuildTool.RoadUpgrade;
 		_mallBuildButton.ButtonPressed = tool == BuildTool.Mall;
-
+		_mallDestroyButton.ButtonPressed = tool == BuildTool.MallDestroy;
+		_roadBlockageButton.ButtonPressed = tool == BuildTool.RoadBlockage;
 		_toolLabel.Text = $"Selected: {ToolName(tool)}";
 	}
 
-	private static string ToolName(BuildTool tool)
+	private static string ToolName(BuildTool tool) => tool switch
 	{
-		return tool switch
-		{
-			BuildTool.Road => "Road",
-			BuildTool.Mall => "Mall",
-			_ => "Pointer"
-		};
-	}
+		BuildTool.Road => "Build Road",
+		BuildTool.RoadDestroy => "Destroy Road",
+		BuildTool.RoadUpgrade => "Upgrade Road",
+		BuildTool.Mall => "Build Mall",
+		BuildTool.MallDestroy => "Destroy Mall",
+		BuildTool.RoadBlockage => "Road Blockage",
+		_ => "Pointer"
+	};
 
 	private void UpdateHud()
 	{
 		if (_dayLabel == null) return;
+		_dayLabel.Text = $"📅 Turn: {_day}";
+		_playerBudgetLabel.Text = $"💰 Budget: ${_playerBudget:0.0}";
+		_optimizerBudgetLabel.Text = $"🏙 City Budget: ${_citizenBudget:0.0}";
+		_previousProfitLabel.Text = $"📈 Last Profit: ${_previousDayProfit:0.0}";
 
-		_dayLabel.Text = $"Turn Count: {_day}";
-		_playerBudgetLabel.Text = $"Current Budget: ${_playerBudget:0.0}";
-		_optimizerBudgetLabel.Text = $"Optimizer Budget: ${_citizenBudget:0.0}";
-		_previousProfitLabel.Text = $"Previous Day's Profit: ${_previousDayProfit:0.0}";
-	}
-
-	private float GetToolCost(BuildTool tool)
-	{
-		return tool switch
+		// Coverage label — color by health
+		if (_coverageLabel != null)
 		{
-			BuildTool.Road => RoadCost,
-			BuildTool.Mall => MallCost,
-			_ => 0f
-		};
+			// Will be set after receiving response
+		}
+
+		// Health bar
+		if (_clinicHealthBar != null && _clinicHealthBarBg != null)
+		{
+			float maxMoney = 120f;
+			float ratio = Mathf.Clamp(_clinicMoney / maxMoney, 0f, 1f);
+			_clinicHealthBar.Size = new Vector2(160f * ratio, 16f);
+			_clinicHealthBar.Color = ratio > 0.5f
+				? new Color(0.2f, 0.8f, 0.3f)
+				: ratio > 0.25f
+					? new Color(0.9f, 0.7f, 0.1f)
+					: new Color(0.9f, 0.2f, 0.1f);
+		}
+
+		// Enable/disable cut funding button
+		if (_cutHospitalFundingButton != null)
+		{
+			_cutHospitalFundingButton.Disabled = _fundingCutUsedThisTurn || _gameOver;
+			_cutHospitalFundingButton.Text = _fundingCutUsedThisTurn
+				? "✂ Funding Cut (used this turn)"
+				: $"✂ Cut Hospital Funding (${CutFundingCost:0})";
+		}
 	}
+
+	private void UpdateCoverageLabel(int clinicCount, float clinicRatio)
+	{
+		if (_coverageLabel == null) return;
+		int total = _housePositions.Count;
+		_coverageLabel.Text = $"🏥 Clinic: {clinicCount}/{total} houses ({clinicRatio * 100f:0.0}%)";
+		// Color is purely informational — coverage doesn’t end the game, money does
+		if (clinicRatio >= 0.5f)
+			_coverageLabel.Modulate = new Color(0.3f, 1f, 0.4f);
+		else if (clinicRatio >= 0.25f)
+			_coverageLabel.Modulate = new Color(1f, 0.9f, 0.2f);
+		else
+			_coverageLabel.Modulate = new Color(1f, 0.3f, 0.3f);
+	}
+
+	// -------------------------------------------------------------------------
+	// Player actions
+	// -------------------------------------------------------------------------
+	private float GetToolCost(BuildTool tool) => tool switch
+	{
+		BuildTool.Road => RoadCost,
+		BuildTool.RoadDestroy => RoadDestroyCost,
+		BuildTool.Mall => MallCost,
+		BuildTool.RoadUpgrade => UpgradeCost,
+		BuildTool.RoadBlockage => BlockageCost,
+		_ => 0f
+	};
 
 	private void TryPlaceSelectedToolAtMouse()
 	{
 		if (_gameOver || _turnInProgress) return;
 		if (_selectedTool == BuildTool.None) return;
-
-		// Ignore map placement when cursor is over HUD controls.
-		if (GetViewport().GuiGetHoveredControl() != null)
-			return;
+		if (GetViewport().GuiGetHoveredControl() != null) return;
 
 		Vector2 mouseWorld = GetGlobalMousePosition();
 		Vector2I gridPos = new(
@@ -883,34 +1157,132 @@ public partial class Main : Node2D
 		if (gridPos.X < 0 || gridPos.X >= GridSize || gridPos.Y < 0 || gridPos.Y >= GridSize)
 			return;
 
-		if (_occupiedTiles.Contains(gridPos))
+		switch (_selectedTool)
 		{
-			_statusLabel.Text = "Cannot build on clinic/hospital/house.";
-			return;
+			case BuildTool.Road:
+				TryBuildRoad(gridPos);
+				break;
+			case BuildTool.RoadDestroy:
+				TryDestroyRoad(gridPos);
+				break;
+			case BuildTool.RoadUpgrade:
+				TryUpgradeRoad(gridPos);
+				break;
+			case BuildTool.Mall:
+				TryBuildMall(gridPos);
+				break;
+			case BuildTool.MallDestroy:
+				TryDestroyMall(gridPos);
+				break;
+			case BuildTool.RoadBlockage:
+				TryBlockRoad(gridPos);
+				break;
 		}
-
-		if (_structures.ContainsKey(gridPos))
-		{
-			_statusLabel.Text = "Tile already has a structure.";
-			return;
-		}
-
-		float cost = GetToolCost(_selectedTool);
-		if (_playerBudget < cost)
-		{
-			_statusLabel.Text = "Not enough budget.";
-			return;
-		}
-
-		_playerBudget -= cost;
-
-		PlaceStructure(gridPos, _selectedTool);
-		UpdateHud();
-
-		_statusLabel.Text = $"{ToolName(_selectedTool)} built at ({gridPos.X}, {gridPos.Y}).";
-		CheckLoseCondition();
 	}
 
+	private void TryBuildRoad(Vector2I gridPos)
+	{
+		if (_occupiedTiles.Contains(gridPos)) { _statusLabel.Text = "Cannot build on clinic/hospital/house."; return; }
+		if (_structures.ContainsKey(gridPos)) { _statusLabel.Text = "Tile already has a structure."; return; }
+		if (_playerBudget < RoadCost) { _statusLabel.Text = "Not enough budget."; return; }
+
+		_playerBudget -= RoadCost;
+		PlaceStructure(gridPos, BuildTool.Road, animated: true);
+		UpdateHud();
+		_statusLabel.Text = $"Road built at ({gridPos.X}, {gridPos.Y}).";
+	}
+
+	private void TryDestroyRoad(Vector2I gridPos)
+	{
+		if (!_structures.TryGetValue(gridPos, out var t) || t != BuildTool.Road)
+		{
+			_statusLabel.Text = "No road to destroy here.";
+			return;
+		}
+		if (_playerBudget < RoadDestroyCost) { _statusLabel.Text = "Not enough budget to demolish."; return; }
+		_playerBudget -= RoadDestroyCost;
+		DestroyStructureAt(gridPos, animated: true);
+		UpdateHud();
+		_statusLabel.Text = $"Road demolished at ({gridPos.X}, {gridPos.Y}). Cost: ${RoadDestroyCost:0.0}";
+	}
+
+	private void TryUpgradeRoad(Vector2I gridPos)
+	{
+		if (!_structures.TryGetValue(gridPos, out var t) || t != BuildTool.Road)
+		{
+			_statusLabel.Text = "No road to upgrade here.";
+			return;
+		}
+		if (_upgradedRoads.Contains(gridPos)) { _statusLabel.Text = "Road already upgraded."; return; }
+		if (_playerBudget < UpgradeCost) { _statusLabel.Text = "Not enough budget."; return; }
+
+		_playerBudget -= UpgradeCost;
+		_upgradedRoads.Add(gridPos);
+		RefreshRoadAt(gridPos); // re-render with green tint
+		if (_structureNodes.TryGetValue(gridPos, out var node))
+			AnimateUpgrade(node);
+		UpdateHud();
+		_statusLabel.Text = $"Road upgraded at ({gridPos.X}, {gridPos.Y}). Travel cost reduced.";
+	}
+
+	private void TryBuildMall(Vector2I gridPos)
+	{
+		if (_occupiedTiles.Contains(gridPos)) { _statusLabel.Text = "Cannot build on clinic/hospital/house."; return; }
+		if (_structures.ContainsKey(gridPos)) { _statusLabel.Text = "Tile already has a structure."; return; }
+		if (_playerBudget < MallCost) { _statusLabel.Text = "Not enough budget."; return; }
+
+		_playerBudget -= MallCost;
+		PlaceStructure(gridPos, BuildTool.Mall, animated: true);
+		UpdateHud();
+		_statusLabel.Text = $"Mall built at ({gridPos.X}, {gridPos.Y}). Adds congestion to nearby roads.";
+	}
+
+	private void TryDestroyMall(Vector2I gridPos)
+	{
+		if (!_structures.TryGetValue(gridPos, out var t) || t != BuildTool.Mall)
+		{
+			_statusLabel.Text = "No mall to destroy here.";
+			return;
+		}
+		DestroyStructureAt(gridPos, animated: true);
+		UpdateHud();
+		_statusLabel.Text = $"Mall demolished at ({gridPos.X}, {gridPos.Y}).";
+	}
+
+	private void TryBlockRoad(Vector2I gridPos)
+	{
+		if (!_structures.TryGetValue(gridPos, out var t) || t != BuildTool.Road)
+		{
+			_statusLabel.Text = "No road to block here.";
+			return;
+		}
+		if (_blockedRoads.Contains(gridPos)) { _statusLabel.Text = "Road already blocked this turn."; return; }
+		if (_playerBudget < BlockageCost) { _statusLabel.Text = "Not enough budget."; return; }
+
+		_playerBudget -= BlockageCost;
+		_blockedRoads.Add(gridPos);
+		RefreshRoadAt(gridPos); // orange tint
+		if (_structureNodes.TryGetValue(gridPos, out var node))
+			AnimateBlock(node);
+		UpdateHud();
+		_statusLabel.Text = $"🚧 Road blocked at ({gridPos.X}, {gridPos.Y}) for this turn.";
+	}
+
+	private void TryCutHospitalFunding()
+	{
+		if (_fundingCutUsedThisTurn) { _statusLabel.Text = "Already cut funding this turn."; return; }
+		if (_playerBudget < CutFundingCost) { _statusLabel.Text = "Not enough budget."; return; }
+
+		_playerBudget -= CutFundingCost;
+		_hospitalFundingCutActive = true;
+		_fundingCutUsedThisTurn = true;
+		UpdateHud();
+		_statusLabel.Text = "✂ Hospital funding cut! All hospital routes cost more this turn.";
+	}
+
+	// -------------------------------------------------------------------------
+	// Turn logic
+	// -------------------------------------------------------------------------
 	private void SendInitialOptimizationRequest()
 	{
 		_statusLabel.Text = "Initial handoff to GAMSPy...";
@@ -920,14 +1292,11 @@ public partial class Main : Node2D
 
 	private void EndTurn()
 	{
-		if (_gameOver || _turnInProgress)
-			return;
-
+		if (_gameOver || _turnInProgress) return;
 		_turnInProgress = true;
 		_endTurnButton.Disabled = true;
 		_resolveTurnAfterResponse = true;
-
-		_statusLabel.Text = "Turn ended. Sending to GAMSPy...";
+		_statusLabel.Text = "Turn ended. Contacting GAMSPy optimizer...";
 		SendOptimizationRequest();
 	}
 
@@ -937,24 +1306,17 @@ public partial class Main : Node2D
 		string json = JsonSerializer.Serialize(payload);
 		string[] headers = { "Content-Type: application/json" };
 
-		Error err = _http.Request(
-			"http://127.0.0.1:8000/solve",
-			headers,
-			HttpClient.Method.Post,
-			json
-		);
-
+		Error err = _http.Request("http://127.0.0.1:8000/solve", headers, HttpClient.Method.Post, json);
 		if (err != Error.Ok)
 		{
-			GD.PrintErr($"Failed to send optimization request: {err}");
+			GD.PrintErr($"HTTP request error: {err}");
 			_statusLabel.Text = $"HTTP error: {err}";
 			_turnInProgress = false;
 			_endTurnButton.Disabled = _gameOver;
 		}
 		else
 		{
-			GD.Print("Sent optimization request:");
-			GD.Print(json);
+			GD.Print("Sent optimization request.");
 		}
 	}
 
@@ -962,139 +1324,69 @@ public partial class Main : Node2D
 	{
 		var facilities = new List<FacilityData>
 		{
-			new FacilityData
-			{
-				id = "Clinic",
-				type = "clinic",
-				x = _clinicPos.X,
-				y = _clinicPos.Y
-			}
+			new() { id = "Clinic", type = "clinic", x = _clinicPos.X, y = _clinicPos.Y }
 		};
-
 		for (int i = 0; i < _hospitalPositions.Count; i++)
 		{
 			var hp = _hospitalPositions[i];
-			facilities.Add(new FacilityData
-			{
-				id = $"Hospital_{i}",
-				type = "hospital",
-				x = hp.X,
-				y = hp.Y
-			});
+			facilities.Add(new() { id = $"Hospital_{i}", type = "hospital", x = hp.X, y = hp.Y });
 		}
 
 		var houses = new List<HouseData>();
-		var houseAccess = new List<FacilityCost>();
-		var existingRoads = new List<GridPoint>();
-
 		for (int i = 0; i < _housePositions.Count; i++)
 		{
-			string houseId = $"House_{i}";
-			Vector2I housePos = _housePositions[i];
-			houses.Add(new HouseData
-			{
-				id = houseId,
-				x = housePos.X,
-				y = housePos.Y
-			});
-
-			houseAccess.Add(new FacilityCost
-			{
-				house = houseId,
-				facility = "Clinic",
-				travel_cost = ComputeTravelCost(housePos, _clinicPos, isClinic: true)
-			});
-
-			for (int h = 0; h < _hospitalPositions.Count; h++)
-			{
-				houseAccess.Add(new FacilityCost
-				{
-					house = houseId,
-					facility = $"Hospital_{h}",
-					travel_cost = ComputeTravelCost(housePos, _hospitalPositions[h], isClinic: false)
-				});
-			}
+			var hp = _housePositions[i];
+			houses.Add(new() { id = $"House_{i}", x = hp.X, y = hp.Y });
 		}
+
+		var existingRoads = new List<GridPoint>();
+		var mallPositions = new List<GridPoint>();
+		var upgradedRoads = new List<GridPoint>();
+		var blockedRoads = new List<GridPoint>();
 
 		foreach (var kv in _structures)
 		{
-			if (kv.Value != BuildTool.Road)
-				continue;
-
-			existingRoads.Add(new GridPoint
-			{
-				x = kv.Key.X,
-				y = kv.Key.Y
-			});
+			if (kv.Value == BuildTool.Road)
+				existingRoads.Add(new() { x = kv.Key.X, y = kv.Key.Y });
+			else if (kv.Value == BuildTool.Mall)
+				mallPositions.Add(new() { x = kv.Key.X, y = kv.Key.Y });
 		}
+		foreach (var p in _upgradedRoads)
+			upgradedRoads.Add(new() { x = p.X, y = p.Y });
+		foreach (var p in _blockedRoads)
+			blockedRoads.Add(new() { x = p.X, y = p.Y });
 
 		return new SolveRequest
 		{
 			houses = houses,
 			facilities = facilities,
-			house_access = houseAccess,
+			house_access = new List<FacilityCost>(), // computed server-side now
 			existing_roads = existingRoads,
 			budget = Mathf.Min(_playerBudget, _clinicMoney),
 			road_cost = RoadCost,
 			turn_index = _day,
-			setup_phase = !_resolveTurnAfterResponse
+			setup_phase = !_resolveTurnAfterResponse,
+			mall_positions = mallPositions,
+			upgraded_roads = upgradedRoads,
+			blocked_roads = blockedRoads,
+			hospital_funding_cut = _hospitalFundingCutActive,
+			citizen_budget = _citizenBudget,
 		};
 	}
 
-	private float ComputeTravelCost(Vector2I from, Vector2I to, bool isClinic)
-	{
-		float dist = Manhattan(from, to);
-		float congestion = ((from.X * 3 + from.Y + to.X + to.Y) % 5) * 0.4f;
-		float clinicPenalty = isClinic ? 1.2f : 0f;
-
-		// Citizen side pressure each day: favors hospitals, hurts clinic.
-		float citizenBias = isClinic ? _citizenClinicPenalty : -_citizenHospitalBonus;
-
-		// Player-built structures affect route cost.
-		float structureDelta = 0f;
-		foreach (var kv in _structures)
-		{
-			Vector2I p = kv.Key;
-			BuildTool t = kv.Value;
-
-			if (t == BuildTool.Road && IsOnManhattanRoute(p, from, to))
-				structureDelta -= 0.9f;
-
-			if (t == BuildTool.Mall && IsNearManhattanRoute(p, from, to))
-				structureDelta += 1.4f;
-		}
-
-		float total = dist + congestion + clinicPenalty + citizenBias + structureDelta;
-		return Mathf.Max(1f, total);
-	}
-
+	// -------------------------------------------------------------------------
+	// Optimizer response handling
+	// -------------------------------------------------------------------------
 	private void OnRequestCompleted(long result, long responseCode, string[] headers, byte[] body)
 	{
 		string responseText = Encoding.UTF8.GetString(body);
-		GD.Print($"Optimizer response code: {responseCode}");
-		GD.Print(responseText);
+		GD.Print($"Optimizer response: {responseCode}");
 
-		if (result != (long)HttpRequest.Result.Success)
+		if (result != (long)HttpRequest.Result.Success || responseCode < 200 || responseCode >= 300)
 		{
-			string message = $"Optimizer request failed: {(HttpRequest.Result)result}";
-			if (!string.IsNullOrWhiteSpace(responseText))
-				message += $" | {responseText}";
-
-			GD.PrintErr(message);
-			_statusLabel.Text = message;
-			_turnInProgress = false;
-			_endTurnButton.Disabled = _gameOver;
-			return;
-		}
-
-		if (responseCode < 200 || responseCode >= 300)
-		{
-			string message = $"Optimizer returned HTTP {responseCode}";
-			if (!string.IsNullOrWhiteSpace(responseText))
-				message += $" | {responseText}";
-
-			GD.PrintErr(message);
-			_statusLabel.Text = message;
+			string msg = $"Optimizer error {responseCode}: {responseText}";
+			GD.PrintErr(msg);
+			_statusLabel.Text = msg;
 			_turnInProgress = false;
 			_endTurnButton.Disabled = _gameOver;
 			return;
@@ -1102,45 +1394,44 @@ public partial class Main : Node2D
 
 		if (string.IsNullOrWhiteSpace(responseText))
 		{
-			const string message = "Optimizer returned an empty response body.";
-			GD.PrintErr(message);
-			_statusLabel.Text = message;
+			_statusLabel.Text = "Optimizer returned empty response.";
 			_turnInProgress = false;
 			_endTurnButton.Disabled = _gameOver;
 			return;
 		}
 
 		SolveResponse response = null;
-		try
-		{
-			response = JsonSerializer.Deserialize<SolveResponse>(responseText);
-		}
+		try { response = JsonSerializer.Deserialize<SolveResponse>(responseText); }
 		catch (Exception e)
 		{
-			string message = $"Failed to parse optimizer response: {e.Message}";
-			GD.PrintErr(message);
-			_statusLabel.Text = message;
+			_statusLabel.Text = $"Parse error: {e.Message}";
 			_turnInProgress = false;
 			_endTurnButton.Disabled = _gameOver;
 			return;
 		}
 
-		int roadsBuilt = ApplyOptimizerRoads(response);
-		float roadSpendCap = roadsBuilt * RoadCost;
-		float roadSpend = Mathf.Min(response?.spent_budget ?? 0f, roadSpendCap);
+		// Apply player roads (built by setup phase or city's own routing)
+		int playerRoadsBuilt = ApplyRoadList(response?.built_roads, isOptimizerRoad: false, animate: _resolveTurnAfterResponse);
+		int cityRoadsBuilt   = ApplyRoadList(response?.optimizer_roads, isOptimizerRoad: true, animate: _resolveTurnAfterResponse);
 
 		UpdateFacilityPatientCounts(response);
+		DrawRouteLines(response?.preferred_facility);
+
+		int clinicCount  = response?.clinic_count ?? 0;
+		float clinicRatio = response?.clinic_ratio ?? 0f;
+		UpdateCoverageLabel(clinicCount, clinicRatio);
 
 		if (_resolveTurnAfterResponse)
 		{
-			ResolveTurn(response, roadSpend, roadsBuilt);
+			float roadSpend = playerRoadsBuilt * RoadCost;
+			ResolveTurn(response, roadSpend, playerRoadsBuilt, cityRoadsBuilt);
 			_resolveTurnAfterResponse = false;
 		}
 		else
 		{
-			_statusLabel.Text = roadsBuilt > 0
-				? $"Initial optimization done. GAMSPy built {roadsBuilt} road(s). Build and press End Turn."
-				: "Initial optimization done. Build and press End Turn.";
+			_statusLabel.Text = playerRoadsBuilt > 0
+				? $"Initial setup done. GAMSPy placed {playerRoadsBuilt} road(s). Build and press End Turn."
+				: "Ready. Build roads and press End Turn.";
 		}
 
 		_turnInProgress = false;
@@ -1148,101 +1439,166 @@ public partial class Main : Node2D
 		UpdateHud();
 	}
 
-	private void ResolveTurn(SolveResponse response, float roadSpend, int roadsBuilt)
+	private void ResolveTurn(SolveResponse response, float roadSpend, int playerRoads, int cityRoads)
 	{
 		_day++;
 
-		int clinicCount = ExtractClinicCount(response);
-		float clinicRatio = response != null ? response.clinic_ratio : 0f;
+		int clinicCount   = response?.clinic_count ?? 0;
+		float clinicRatio = response?.clinic_ratio ?? 0f;
 
-		float income = clinicCount * RevenuePerPatient;
-		float upkeep = DailyClinicUpkeep + Mathf.Min(_day * DailyUpkeepGrowth, 12f);
-		_previousDayProfit = income - upkeep - roadSpend;
+		// Economy
+		float income  = clinicCount * RevenuePerPatient;
+		float upkeep  = DailyClinicUpkeep + Mathf.Min(_day * DailyUpkeepGrowth, 15f);
+		float profit  = income - upkeep - roadSpend;
 
+		_previousDayProfit = profit;
+		_totalRevenue += income;
+		_peakCoverage = Mathf.Max(_peakCoverage, clinicRatio);
+
+		_playerBudget += income - upkeep;
 		_playerBudget -= roadSpend;
-		_clinicMoney -= roadSpend;
-		_clinicMoney += income - upkeep;
-		_playerBudget += income;
+		_clinicMoney  += income - upkeep;
+		_clinicMoney  -= roadSpend;
 
-		ApplyCitizenCounterTurn();
+		// City counter-turn budget
+		_citizenBudget += 3f + (_housePositions.Count * 0.3f);
 
-		if (CheckLoseCondition())
-			return;
+		// Reset per-turn effects
+		_blockedRoads.Clear();
+		_hospitalFundingCutActive = false;
+		_fundingCutUsedThisTurn = false;
+
+		// Re-render roads (unblock tints)
+		foreach (var kv in _structures)
+			if (kv.Value == BuildTool.Road)
+				RefreshRoadAt(kv.Key);
+
+		if (CheckLoseCondition(clinicRatio)) return;
 
 		_statusLabel.Text =
-			$"Day {_day}: clinic patients={clinicCount}, ratio={clinicRatio:0.00}, roads built={roadsBuilt}, road spend=${roadSpend:0.0}, income=${income:0.0}, upkeep=${upkeep:0.0}.";
+			$"Day {_day}: {clinicCount}/{_housePositions.Count} houses chose clinic ({clinicRatio * 100f:0.0}%). " +
+			$"Income: ${income:0.0} | Upkeep: ${upkeep:0.0} | City built {cityRoads} road(s).";
 	}
 
-	private int ExtractClinicCount(SolveResponse response)
+	private int ApplyRoadList(List<GridPoint> roads, bool isOptimizerRoad, bool animate)
 	{
-		if (response == null) return 0;
-		if (response.clinic_count > 0) return response.clinic_count;
-
-		int count = 0;
-		if (response.preferred_facility != null)
+		if (roads == null) return 0;
+		int applied = 0;
+		foreach (var road in roads)
 		{
-			foreach (var kv in response.preferred_facility)
-			{
-				if (kv.Value == "Clinic")
-					count++;
-			}
+			Vector2I pos = new(road.x, road.y);
+			if (!IsBuildableRoadTile(pos)) continue;
+			PlaceStructure(pos, BuildTool.Road, animated: animate, isOptimizerRoad: isOptimizerRoad);
+			applied++;
 		}
-		return count;
+		return applied;
 	}
 
-	private void ApplyCitizenCounterTurn()
+	private void UpdateFacilityPatientCounts(SolveResponse response)
 	{
-		// Citizen side gets and spends budget each day to optimize for itself.
-		_citizenBudget += 2f + (_housePositions.Count * 0.5f);
-
-		const float spend = 4f;
-		if (_citizenBudget >= spend)
+		_facilityPatientCounts.Clear();
+		if (response?.preferred_facility == null) return;
+		foreach (var kv in response.preferred_facility)
 		{
-			_citizenBudget -= spend;
-			_citizenHospitalBonus = Mathf.Min(_citizenHospitalBonus + 0.30f, 4f);
-			_citizenClinicPenalty = Mathf.Min(_citizenClinicPenalty + 0.20f, 3f);
+			string fid = kv.Value;
+			if (string.IsNullOrEmpty(fid)) continue;
+			_facilityPatientCounts[fid] = _facilityPatientCounts.TryGetValue(fid, out int cur) ? cur + 1 : 1;
 		}
+		if (response.clinic_count >= 0)
+			_facilityPatientCounts["Clinic"] = response.clinic_count;
 	}
 
-	private bool CheckLoseCondition()
+	// -------------------------------------------------------------------------
+	// Lose / game-over
+	// -------------------------------------------------------------------------
+	private bool CheckLoseCondition(float clinicRatio = -1f)
 	{
 		if (_clinicMoney > 0f)
 			return false;
 
 		_gameOver = true;
-		_endTurnButton.Disabled = true;
-		_pointerButton.Disabled = true;
-		_roadBuildButton.Disabled = true;
-		_roadDestroyButton.Disabled = true;
-		_roadUpgradeButton.Disabled = true;
-		_mallBuildButton.Disabled = true;
-		_mallDestroyButton.Disabled = true;
-		_cutHospitalFundingButton.Disabled = true;
-		_roadBlockageButton.Disabled = true;
-
-		_statusLabel.Text = $"Game Over. Clinic ran out of money. Final score: {_day} days survived.";
+		DisableAllButtons();
+		ShowGameOverScreen("The clinic ran out of money.");
 		return true;
 	}
 
-	private static int Manhattan(Vector2I a, Vector2I b)
+	private void DisableAllButtons()
 	{
-		return Mathf.Abs(a.X - b.X) + Mathf.Abs(a.Y - b.Y);
+		foreach (Button btn in new[] {
+			_endTurnButton, _pointerButton, _roadBuildButton, _roadDestroyButton,
+			_roadUpgradeButton, _mallBuildButton, _mallDestroyButton,
+			_cutHospitalFundingButton, _roadBlockageButton
+		})
+		{
+			if (btn != null) btn.Disabled = true;
+		}
 	}
 
-	private static bool IsOnManhattanRoute(Vector2I p, Vector2I a, Vector2I b)
+	private void ShowGameOverScreen(string reason)
 	{
-		return Manhattan(a, p) + Manhattan(p, b) == Manhattan(a, b);
+		var layer = GetNode<CanvasLayer>("HUDLayer");
+
+		// Dark overlay
+		var overlay = new ColorRect
+		{
+			Color = new Color(0f, 0f, 0f, 0.72f),
+			AnchorRight = 1f,
+			AnchorBottom = 1f,
+			ZIndex = 100,
+			MouseFilter = Control.MouseFilterEnum.Ignore
+		};
+		layer.AddChild(overlay);
+
+		// Panel in center
+		var panel = new PanelContainer
+		{
+			CustomMinimumSize = new Vector2(420, 250),
+			ZIndex = 101
+		};
+		layer.AddChild(panel);
+
+		var vbox = new VBoxContainer();
+		panel.AddChild(vbox);
+
+		var titleLbl = new Label
+		{
+			Text = "🏚  CLINIC CLOSED",
+			HorizontalAlignment = HorizontalAlignment.Center
+		};
+		titleLbl.AddThemeFontSizeOverride("font_size", 26);
+		titleLbl.Modulate = new Color(1f, 0.3f, 0.3f);
+		vbox.AddChild(titleLbl);
+
+		vbox.AddChild(new Label { Text = reason, HorizontalAlignment = HorizontalAlignment.Center });
+		vbox.AddChild(new Label { Text = $"Days survived: {_day}", HorizontalAlignment = HorizontalAlignment.Center });
+		vbox.AddChild(new Label { Text = $"Peak clinic coverage: {_peakCoverage * 100f:0.0}%", HorizontalAlignment = HorizontalAlignment.Center });
+		vbox.AddChild(new Label { Text = $"Total revenue earned: ${_totalRevenue:0.0}", HorizontalAlignment = HorizontalAlignment.Center });
+
+		// Center panel after one frame
+		CallDeferred(nameof(CenterNode), panel);
 	}
 
-	private static bool IsNearManhattanRoute(Vector2I p, Vector2I a, Vector2I b)
+	private void CenterNode(PanelContainer panel)
 	{
-		return Manhattan(a, p) + Manhattan(p, b) <= Manhattan(a, b) + 1;
+		var vs = GetViewportRect().Size;
+		panel.Position = (vs - panel.Size) * 0.5f;
 	}
 
-	private float Distance(Vector2I a, Vector2I b)
+	// -------------------------------------------------------------------------
+	// Utilities
+	// -------------------------------------------------------------------------
+	private bool IsBuildableRoadTile(Vector2I pos)
 	{
-		return Mathf.Sqrt(Mathf.Pow(a.X - b.X, 2) + Mathf.Pow(a.Y - b.Y, 2));
+		if (pos.X < 0 || pos.X >= GridSize || pos.Y < 0 || pos.Y >= GridSize) return false;
+		if (_occupiedTiles.Contains(pos)) return false;
+		return !_structures.ContainsKey(pos);
 	}
+
+	private static int Manhattan(Vector2I a, Vector2I b) =>
+		Mathf.Abs(a.X - b.X) + Mathf.Abs(a.Y - b.Y);
+
+	private float Distance(Vector2I a, Vector2I b) =>
+		Mathf.Sqrt(Mathf.Pow(a.X - b.X, 2) + Mathf.Pow(a.Y - b.Y, 2));
 
 	public override void _UnhandledInput(InputEvent @event)
 	{
@@ -1252,80 +1608,23 @@ public partial class Main : Node2D
 				_camera.Zoom *= 1.1f;
 			if (mb.ButtonIndex == MouseButton.WheelDown && mb.Pressed)
 				_camera.Zoom *= 0.9f;
-
 			if (mb.ButtonIndex == MouseButton.Middle)
 				_isDragging = mb.Pressed;
-
 			if (mb.ButtonIndex == MouseButton.Left && mb.Pressed)
 				TryPlaceSelectedToolAtMouse();
+			if (mb.ButtonIndex == MouseButton.Right && mb.Pressed)
+				SetSelectedTool(BuildTool.None);
 		}
 		else if (@event is InputEventMouseMotion mm && _isDragging)
 		{
 			_camera.Position -= mm.Relative / _camera.Zoom;
 		}
 	}
-
-	private void UpdateFacilityPatientCounts(SolveResponse response)
-	{
-		_facilityPatientCounts.Clear();
-
-		if (response?.preferred_facility == null)
-			return;
-
-		foreach (var kv in response.preferred_facility)
-		{
-			string facilityId = kv.Value;
-			if (string.IsNullOrEmpty(facilityId))
-				continue;
-
-			if (_facilityPatientCounts.TryGetValue(facilityId, out int current))
-				_facilityPatientCounts[facilityId] = current + 1;
-			else
-				_facilityPatientCounts[facilityId] = 1;
-		}
-
-		if (response.clinic_count >= 0)
-			_facilityPatientCounts["Clinic"] = response.clinic_count;
-	}
-
-	private void ShowUnavailableAction(string message)
-	{
-		_statusLabel.Text = message;
-		SetSelectedTool(BuildTool.None);
-	}
-
-	private int ApplyOptimizerRoads(SolveResponse response)
-	{
-		if (response?.built_roads == null)
-			return 0;
-
-		int applied = 0;
-		foreach (var road in response.built_roads)
-		{
-			Vector2I pos = new(road.x, road.y);
-			if (!IsBuildableRoadTile(pos))
-				continue;
-
-			PlaceStructure(pos, BuildTool.Road);
-			applied++;
-		}
-
-		return applied;
-	}
-
-	private bool IsBuildableRoadTile(Vector2I pos)
-	{
-		if (pos.X < 0 || pos.X >= GridSize || pos.Y < 0 || pos.Y >= GridSize)
-			return false;
-
-		if (_occupiedTiles.Contains(pos))
-			return false;
-
-		return !_structures.ContainsKey(pos);
-	}
 }
 
-// Request/response models
+// ---------------------------------------------------------------------------
+// Request / response models
+// ---------------------------------------------------------------------------
 
 public class SolveRequest
 {
@@ -1337,6 +1636,12 @@ public class SolveRequest
 	public float road_cost { get; set; }
 	public int turn_index { get; set; }
 	public bool setup_phase { get; set; }
+	// New fields
+	public List<GridPoint> mall_positions { get; set; }
+	public List<GridPoint> upgraded_roads { get; set; }
+	public List<GridPoint> blocked_roads { get; set; }
+	public bool hospital_funding_cut { get; set; }
+	public float citizen_budget { get; set; }
 }
 
 public class HouseData
@@ -1378,4 +1683,5 @@ public class SolveResponse
 	public float budget_seen { get; set; }
 	public float spent_budget { get; set; }
 	public List<GridPoint> built_roads { get; set; }
+	public List<GridPoint> optimizer_roads { get; set; }   // city-built roads
 }

@@ -5,6 +5,7 @@ from model import solve_turn
 
 app = FastAPI()
 
+
 class GridPoint(BaseModel):
     x: int
     y: int
@@ -22,10 +23,12 @@ class FacilityData(BaseModel):
     x: int
     y: int
 
+
 class FacilityCost(BaseModel):
     house: str
     facility: str
     travel_cost: float
+
 
 class SolveRequest(BaseModel):
     houses: List[HouseData]
@@ -36,6 +39,13 @@ class SolveRequest(BaseModel):
     road_cost: float = 3.0
     turn_index: int = 0
     setup_phase: bool = False
+    # New fields for richer optimization
+    mall_positions: List[GridPoint] = Field(default_factory=list)
+    upgraded_roads: List[GridPoint] = Field(default_factory=list)
+    blocked_roads: List[GridPoint] = Field(default_factory=list)
+    hospital_funding_cut: bool = False
+    citizen_budget: float = 0.0
+
 
 @app.post("/solve")
 def solve(data: SolveRequest):

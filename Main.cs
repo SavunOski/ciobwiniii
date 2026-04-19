@@ -49,6 +49,18 @@ public partial class Main : Node2D
 	private readonly HashSet<Vector2I> _optimizerRoads = new(); // roads built by city
 	private readonly List<Line2D> _routeLines = new();
 
+	// Sea wave animation
+	private readonly List<ColorRect> _waveRects = new();
+	private float _waveTime = 0f;
+
+	// Loading screen
+	private CanvasLayer _loadingLayer;
+	private Label _loadingDotsLabel;
+	private ColorRect _loadingBar;
+	private ColorRect _loadingBarFill;
+	private float _loadingTime = 0f;
+	private bool _loadingVisible = false;
+
 	private Vector2I _clinicPos;
 
 	// Game state
@@ -127,6 +139,8 @@ public partial class Main : Node2D
 		RenderingServer.SetDefaultClearColor(new Color(0.08f, 0.35f, 0.65f));
 
 		GenerateGrid();
+		GenerateWaves();
+		CreateLoadingScreen();
 		CreateHud();
 		UpdateHud();
 		SetSelectedTool(BuildTool.None);
@@ -138,6 +152,8 @@ public partial class Main : Node2D
 	{
 		UpdateHudLayout();
 		UpdateHoverStats(delta);
+		AnimateWaves(delta);
+		AnimateLoadingScreen(delta);
 	}
 
 	// -------------------------------------------------------------------------
@@ -429,6 +445,137 @@ public partial class Main : Node2D
 	}
 
 	// -------------------------------------------------------------------------
+	// Sea wave animation
+	// -------------------------------------------------------------------------
+	private void GenerateWaves()
+	{
+		int gridPixels = GridSize * TileSpacing;
+		int margin     = 4 * TileSpacing;
+		int waveRows   = 5;
+		int waveH      = TileSpacing;
+
+		for (int i = 0; i < waveRows; i++)  // top
+			_waveRects.Add(MakeWaveRect(new Rect2(-margin, -(i + 1) * waveH, gridPixels + margin * 2, waveH)));
+		for (int i = 0; i < waveRows; i++)  // bottom
+			_waveRects.Add(MakeWaveRect(new Rect2(-margin, gridPixels + i * waveH, gridPixels + margin * 2, waveH)));
+		for (int i = 0; i < waveRows; i++)  // left
+			_waveRects.Add(MakeWaveRect(new Rect2(-(i + 1) * waveH, 0, waveH, gridPixels)));
+		for (int i = 0; i < waveRows; i++)  // right
+			_waveRects.Add(MakeWaveRect(new Rect2(gridPixels + i * waveH, 0, waveH, gridPixels)));
+	}
+
+	private ColorRect MakeWaveRect(Rect2 rect)
+	{
+		var cr = new ColorRect
+		{
+			Position    = rect.Position,
+			Size        = rect.Size,
+			Color       = new Color(0.05f, 0.30f, 0.62f, 0.72f),
+			ZIndex      = -1,
+			MouseFilter = Control.MouseFilterEnum.Ignore,
+		};
+		AddChild(cr);
+		return cr;
+	}
+
+	private void AnimateWaves(double delta)
+	{
+		_waveTime += (float)delta;
+		for (int i = 0; i < _waveRects.Count; i++)
+		{
+			float phase  = _waveTime * 0.8f + i * 0.55f;
+			float alpha  = 0.55f + 0.22f * Mathf.Sin(phase);
+			float bright = 0.28f + 0.10f * Mathf.Cos(phase * 0.7f);
+			_waveRects[i].Color = new Color(0.04f, bright, 0.58f + bright * 0.2f, alpha);
+		}
+	}
+
+	// -------------------------------------------------------------------------
+	// Loading screen
+	// -------------------------------------------------------------------------
+	private void CreateLoadingScreen()
+	{
+		_loadingLayer = new CanvasLayer { Layer = 200, Name = "LoadingLayer" };
+		AddChild(_loadingLayer);
+
+		var overlay = new ColorRect
+		{
+			Color         = new Color(0.04f, 0.06f, 0.12f, 0.97f),
+			AnchorsPreset = (int)Control.LayoutPreset.FullRect,
+			MouseFilter   = Control.MouseFilterEnum.Stop,
+		};
+		_loadingLayer.AddChild(overlay);
+
+		var panel = new VBoxContainer
+		{
+			AnchorsPreset     = (int)Control.LayoutPreset.Center,
+			GrowHorizontal    = Control.GrowDirection.Both,
+			GrowVertical      = Control.GrowDirection.Both,
+			CustomMinimumSize = new Vector2(480, 260),
+		};
+		panel.AddThemeConstantOverride("separation", 18);
+		_loadingLayer.AddChild(panel);
+
+		var title = new Label { Text = "🏥 Clinic Survival", HorizontalAlignment = HorizontalAlignment.Center };
+		title.AddThemeFontSizeOverride("font_size", 42);
+		title.Modulate = new Color(0.9f, 0.75f, 0.25f);
+		panel.AddChild(title);
+
+		var sub = new Label { Text = "City-Building Optimization", HorizontalAlignment = HorizontalAlignment.Center };
+		sub.AddThemeFontSizeOverride("font_size", 16);
+		sub.Modulate = new Color(0.7f, 0.85f, 1.0f);
+		panel.AddChild(sub);
+
+		panel.AddChild(new Control { CustomMinimumSize = new Vector2(0, 10) });
+
+		_loadingBar = new ColorRect { CustomMinimumSize = new Vector2(440, 8), Color = new Color(0.15f, 0.18f, 0.28f) };
+		panel.AddChild(_loadingBar);
+
+		_loadingBarFill = new ColorRect { Size = new Vector2(0, 8), Color = new Color(0.2f, 0.75f, 1.0f), ZIndex = 1 };
+		_loadingBar.AddChild(_loadingBarFill);
+
+		_loadingDotsLabel = new Label { Text = "Solving optimal routes", HorizontalAlignment = HorizontalAlignment.Center };
+		_loadingDotsLabel.AddThemeFontSizeOverride("font_size", 14);
+		_loadingDotsLabel.Modulate = new Color(0.8f, 0.85f, 0.95f);
+		panel.AddChild(_loadingDotsLabel);
+
+		var pw = new Label { Text = "Powered by GAMSPy LP Optimizer", HorizontalAlignment = HorizontalAlignment.Center };
+		pw.AddThemeFontSizeOverride("font_size", 11);
+		pw.Modulate = new Color(0.45f, 0.55f, 0.70f);
+		panel.AddChild(pw);
+
+		_loadingVisible = true;
+	}
+
+	private void HideLoadingScreen()
+	{
+		if (!_loadingVisible || _loadingLayer == null) return;
+		_loadingVisible = false;
+		var tween = CreateTween();
+		tween.TweenProperty(_loadingLayer, "modulate", new Color(1, 1, 1, 0), 0.5f);
+		tween.TweenCallback(Callable.From(() => _loadingLayer.QueueFree()));
+	}
+
+	private void AnimateLoadingScreen(double delta)
+	{
+		if (!_loadingVisible || _loadingLayer == null) return;
+		_loadingTime += (float)delta;
+
+		int dotCount = (int)(_loadingTime * 2.0f) % 4;
+		if (_loadingDotsLabel != null)
+			_loadingDotsLabel.Text = $"Solving optimal routes{new string('.', dotCount)}";
+
+		if (_loadingBar != null && _loadingBarFill != null)
+		{
+			float totalW = _loadingBar.Size.X > 0 ? _loadingBar.Size.X : 440f;
+			float t      = (_loadingTime % 1.6f) / 1.6f;
+			float fillW  = totalW * Mathf.Sin(t * Mathf.Pi);
+			_loadingBarFill.Size  = new Vector2(fillW, 8f);
+			_loadingBarFill.Color = new Color(0.1f + t * 0.1f, 0.65f + t * 0.3f, 1.0f);
+		}
+	}
+
+	// -------------------------------------------------------------------------
 	// Map generation
 	// -------------------------------------------------------------------------
 	private void GenerateGrid()
@@ -450,11 +597,12 @@ public partial class Main : Node2D
 		{
 			for (int y = 0; y < GridSize; y++)
 			{
-				// Subtle variation: slightly different green shades
-				float shade = 0.47f + (((x * 7 + y * 3) % 8) * 0.012f);
-				Color groundColor = rng.Randf() < 0.08f
-					? new Color(0.3f, 0.3f, 0.3f)   // rocky patch
-					: new Color(0.18f, shade, 0.22f);
+				// Lighter, more vibrant grass with subtle variation
+				float shade = 0.58f + (((x * 7 + y * 3) % 10) * 0.018f);
+				float warm  = 0.25f + (((x * 3 + y * 5) % 6) * 0.008f);
+				Color groundColor = rng.Randf() < 0.06f
+					? new Color(0.52f, 0.50f, 0.44f)   // warm stone patch
+					: new Color(warm, shade, 0.24f);    // fresh spring green
 				PlaceTile(new Vector2I(x, y), groundColor, $"Tile_{x}_{y}");
 			}
 		}
@@ -1627,6 +1775,7 @@ public partial class Main : Node2D
 	// -------------------------------------------------------------------------
 	private void OnRequestCompleted(long result, long responseCode, string[] headers, byte[] body)
 	{
+		HideLoadingScreen();  // dismiss regardless of success/failure
 		string responseText = Encoding.UTF8.GetString(body);
 		GD.Print($"Optimizer response: {responseCode}");
 

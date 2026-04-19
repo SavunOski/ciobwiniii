@@ -83,7 +83,6 @@ public partial class Main : Node2D
 	private Vector2I _lastHoveredTile = new(-1, -1);
 	private float _hoverTimer = 0f;
 
-	// HUD nodes
 	private Label _dayLabel;
 	private Label _playerBudgetLabel;
 	private Label _optimizerBudgetLabel;
@@ -93,7 +92,11 @@ public partial class Main : Node2D
 	private Label _statusLabel;
 	private PanelContainer _hoverTooltip;
 	private Label _hoverTooltipLabel;
-	private PanelContainer _infoPanel;
+
+	private PanelContainer _playerStatsPanel;
+	private PanelContainer _cityStatsPanel;
+	private PanelContainer _clinicStatsPanel;
+
 	private PanelContainer _actionsPanel;
 	private ColorRect _clinicHealthBar;
 	private ColorRect _clinicHealthBarBg;
@@ -976,6 +979,14 @@ public partial class Main : Node2D
 			string file = dir.GetNext();
 			if (string.IsNullOrEmpty(file)) break;
 			if (dir.CurrentIsDir()) continue;
+
+			// Godot 4 automatically creates .import files for recognized textures.
+			// When iterating, we might see 'road.tga.import' instead of 'road.tga' in some builds.
+			if (file.EndsWith(".import", StringComparison.OrdinalIgnoreCase))
+			{
+				file = file.Substring(0, file.Length - 7);
+			}
+
 			if (!file.StartsWith("road", StringComparison.OrdinalIgnoreCase)) continue;
 
 			string ext = Path.GetExtension(file).ToLowerInvariant();
@@ -986,9 +997,12 @@ public partial class Main : Node2D
 			string key = NormalizeRoadKey(suffix);
 			if (string.IsNullOrEmpty(key)) continue;
 
+			// Load the original resource path (Godot handles pulling the mapped .ctex)
 			var tex = GD.Load<Texture2D>($"res://roads/{file}");
-			if (tex != null)
+			if (tex != null && !_roadTextures.ContainsKey(key))
+			{
 				_roadTextures[key] = ToSingleTileTexture(tex);
+			}
 		}
 		dir.ListDirEnd();
 	}
@@ -1074,6 +1088,10 @@ public partial class Main : Node2D
 			case "NS": case "SN": case "V": case "VERT": case "VERTICAL": n = s = true; return;
 			case "EW": case "WE": case "H": case "HOR": case "HORIZONTAL": e = w = true; return;
 			case "NESW": case "CROSS": case "X": case "PLUS": case "INTERSECTION": n = e = s = w = true; return;
+			case "TN": n = e = w = true; return; // Standard Kenney T-junction pointing North (missing South)
+			case "TS": s = e = w = true; return; // Missing North
+			case "TE": n = s = e = true; return; // Missing West
+			case "TW": n = s = w = true; return; // Missing East
 		}
 		foreach (char c in t)
 		{
@@ -1098,8 +1116,8 @@ public partial class Main : Node2D
 			var road = new TextureRect
 			{
 				Name = $"Structure_{gridPos.X}_{gridPos.Y}",
-				Position = new Vector2(gridPos.X * TileSpacing + 1, gridPos.Y * TileSpacing + 1),
-				Size = new Vector2(TileSpacing - 2, TileSpacing - 2),
+				Position = new Vector2(gridPos.X * TileSpacing, gridPos.Y * TileSpacing),
+				Size = new Vector2(TileSpacing, TileSpacing),
 				Texture = tex,
 				StretchMode = TextureRect.StretchModeEnum.Scale,
 				ZIndex = 2,
@@ -1123,7 +1141,22 @@ public partial class Main : Node2D
 		else if (_upgradedRoads.Contains(gridPos))
 			roadNode.Modulate = new Color(0.75f, 1f, 0.75f);
 		else if (_blockedRoads.Contains(gridPos))
+		{
 			roadNode.Modulate = new Color(1f, 0.6f, 0.2f);
+			// Overlay 🚧 emoji so the blockage is visible at a glance
+			var blockLabel = new Label
+			{
+				Text                = "🚧",
+				Position            = new Vector2(gridPos.X * TileSpacing + 10, gridPos.Y * TileSpacing + 8),
+				ZIndex              = 5,
+				MouseFilter         = Control.MouseFilterEnum.Ignore,
+			};
+			blockLabel.AddThemeFontSizeOverride("font_size", 28);
+			AddChild(blockLabel);
+			// Store it alongside the road node so it's cleaned up on RefreshRoadAt
+			// We attach it as metadata so RemoveStructureNode can find it
+			roadNode.SetMeta("block_label_path", blockLabel.GetPath());
+		}
 
 		AddChild(roadNode);
 		_structureNodes[gridPos] = roadNode;
@@ -1133,6 +1166,13 @@ public partial class Main : Node2D
 	{
 		if (_structureNodes.TryGetValue(gridPos, out var oldNode))
 		{
+			// If this road had a blockage emoji label attached, free it too
+			if (oldNode.HasMeta("block_label_path"))
+			{
+				var labelPath = oldNode.GetMeta("block_label_path").AsNodePath();
+				var labelNode = GetNodeOrNull(labelPath);
+				labelNode?.QueueFree();
+			}
 			oldNode.QueueFree();
 			_structureNodes.Remove(gridPos);
 		}
@@ -1178,14 +1218,14 @@ public partial class Main : Node2D
 
 	private Control CreateConnectedRoadFallback(Vector2I gridPos, int mask)
 	{
-		float size = TileSpacing - 2;
+		float size = TileSpacing;
 		float thickness = Mathf.Max(10f, Mathf.Round(size * 0.36f));
 		float center = (size - thickness) * 0.5f;
 
 		var root = new Control
 		{
 			Name = $"Structure_{gridPos.X}_{gridPos.Y}",
-			Position = new Vector2(gridPos.X * TileSpacing + 1, gridPos.Y * TileSpacing + 1),
+			Position = new Vector2(gridPos.X * TileSpacing, gridPos.Y * TileSpacing),
 			Size = new Vector2(size, size),
 			ZIndex = 2,
 			ClipContents = true,
@@ -1292,61 +1332,112 @@ public partial class Main : Node2D
 	// -------------------------------------------------------------------------
 	// HUD creation
 	// -------------------------------------------------------------------------
+	private PanelContainer CreateStyledPanel(Color bgColor, Vector2 minSize)
+	{
+		var panel = new PanelContainer { CustomMinimumSize = minSize };
+		var style = new StyleBoxFlat
+		{
+			BgColor = bgColor,
+			CornerRadiusTopLeft = 12,
+			CornerRadiusTopRight = 12,
+			CornerRadiusBottomLeft = 12,
+			CornerRadiusBottomRight = 12,
+			ContentMarginLeft = 16,
+			ContentMarginRight = 16,
+			ContentMarginTop = 16,
+			ContentMarginBottom = 16,
+			BorderWidthLeft = 2,
+			BorderWidthTop = 2,
+			BorderWidthRight = 2,
+			BorderWidthBottom = 2,
+			BorderColor = new Color(1f, 1f, 1f, 0.15f),
+			ShadowColor = new Color(0, 0, 0, 0.3f),
+			ShadowSize = 8
+		};
+		panel.AddThemeStyleboxOverride("panel", style);
+		return panel;
+	}
+
 	private void CreateHud()
 	{
 		var layer = new CanvasLayer { Name = "HUDLayer" };
 		AddChild(layer);
 
-		// --- Info panel (top-right) ---
-		_infoPanel = new PanelContainer
-		{
-			CustomMinimumSize = new Vector2(340, 160)
-		};
-		layer.AddChild(_infoPanel);
+		// --- Player Stats (Top Left) ---
+		_playerStatsPanel = CreateStyledPanel(new Color(0.12f, 0.35f, 0.2f, 0.9f), new Vector2(260, 90));
+		layer.AddChild(_playerStatsPanel);
+		var playerVBox = new VBoxContainer();
+		_playerStatsPanel.AddChild(playerVBox);
+		
+		_playerBudgetLabel = new Label { Text = "💰 $0.0" };
+		_playerBudgetLabel.AddThemeFontSizeOverride("font_size", 36);
+		_playerBudgetLabel.AddThemeColorOverride("font_color", new Color(0.5f, 1.0f, 0.6f));
+		playerVBox.AddChild(_playerBudgetLabel);
+		
+		_previousProfitLabel = new Label { Text = "📈 +$0.0" };
+		_previousProfitLabel.AddThemeFontSizeOverride("font_size", 18);
+		_previousProfitLabel.AddThemeColorOverride("font_color", new Color(0.8f, 1.0f, 0.8f));
+		playerVBox.AddChild(_previousProfitLabel);
 
-		var infoRoot = new VBoxContainer();
-		_infoPanel.AddChild(infoRoot);
+		// --- City Stats (Top Center) ---
+		_cityStatsPanel = CreateStyledPanel(new Color(0.4f, 0.12f, 0.15f, 0.9f), new Vector2(220, 80));
+		layer.AddChild(_cityStatsPanel);
+		var cityVBox = new VBoxContainer();
+		_cityStatsPanel.AddChild(cityVBox);
+		
+		var cityTitle = MakeLabel("🏙 City Budget", bold: true);
+		cityTitle.HorizontalAlignment = HorizontalAlignment.Center;
+		cityVBox.AddChild(cityTitle);
+		
+		_optimizerBudgetLabel = new Label { Text = "$0.0", HorizontalAlignment = HorizontalAlignment.Center };
+		_optimizerBudgetLabel.AddThemeFontSizeOverride("font_size", 28);
+		_optimizerBudgetLabel.AddThemeColorOverride("font_color", new Color(1.0f, 0.5f, 0.5f));
+		cityVBox.AddChild(_optimizerBudgetLabel);
 
-		_dayLabel = new Label();
-		_playerBudgetLabel = new Label();
-		_optimizerBudgetLabel = new Label();
-		_previousProfitLabel = new Label();
-		_coverageLabel = new Label();
+		// --- Clinic Stats (Top Right) ---
+		_clinicStatsPanel = CreateStyledPanel(new Color(0.15f, 0.2f, 0.35f, 0.9f), new Vector2(320, 110));
+		layer.AddChild(_clinicStatsPanel);
+		var clinicVBox = new VBoxContainer();
+		_clinicStatsPanel.AddChild(clinicVBox);
+
+		var topRow = new HBoxContainer();
+		_dayLabel = new Label { Text = "📅 Turn 0" };
+		_dayLabel.AddThemeFontSizeOverride("font_size", 20);
+		topRow.AddChild(_dayLabel);
+		
+		topRow.AddChild(new Control { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill }); // Spacer
+		
+		_coverageLabel = new Label { Text = "Coverage" };
+		_coverageLabel.AddThemeFontSizeOverride("font_size", 20);
+		topRow.AddChild(_coverageLabel);
+		clinicVBox.AddChild(topRow);
 
 		// Health bar for clinic money
-		var healthBarContainer = new HBoxContainer();
-		healthBarContainer.AddChild(new Label { Text = "Clinic $:", CustomMinimumSize = new Vector2(72, 0) });
+		var healthBarContainer = new VBoxContainer();
+		var clinicHealthTitle = MakeLabel("Clinic Health ($)", bold: true);
+		clinicHealthTitle.HorizontalAlignment = HorizontalAlignment.Center;
+		healthBarContainer.AddChild(clinicHealthTitle);
+		
 		_clinicHealthBarBg = new ColorRect
 		{
-			CustomMinimumSize = new Vector2(160, 16),
-			Color = new Color(0.2f, 0.2f, 0.2f)
+			CustomMinimumSize = new Vector2(280, 20),
+			Color = new Color(0.1f, 0.1f, 0.15f)
 		};
 		_clinicHealthBar = new ColorRect
 		{
-			CustomMinimumSize = new Vector2(160, 16),
+			CustomMinimumSize = new Vector2(280, 20),
 			Color = new Color(0.2f, 0.8f, 0.3f),
-			Size = new Vector2(160, 16),
+			Size = new Vector2(280, 20),
 			Position = Vector2.Zero
 		};
-		// Stack bar on top of bg using a Control
-		var barStack = new Control { CustomMinimumSize = new Vector2(160, 16) };
+		var barStack = new Control { CustomMinimumSize = new Vector2(280, 20) };
 		barStack.AddChild(_clinicHealthBarBg);
 		barStack.AddChild(_clinicHealthBar);
-		_clinicHealthBarBg.Size = new Vector2(160, 16);
 		healthBarContainer.AddChild(barStack);
-
-		infoRoot.AddChild(_dayLabel);
-		infoRoot.AddChild(_playerBudgetLabel);
-		infoRoot.AddChild(_optimizerBudgetLabel);
-		infoRoot.AddChild(_previousProfitLabel);
-		infoRoot.AddChild(_coverageLabel);
-		infoRoot.AddChild(healthBarContainer);
+		clinicVBox.AddChild(healthBarContainer);
 
 		// --- Actions panel (bottom-left) ---
-		_actionsPanel = new PanelContainer
-		{
-			CustomMinimumSize = new Vector2(370, 320)
-		};
+		_actionsPanel = CreateStyledPanel(new Color(0.12f, 0.12f, 0.15f, 0.95f), new Vector2(370, 320));
 		layer.AddChild(_actionsPanel);
 
 		var actionsRoot = new VBoxContainer();
@@ -1395,10 +1486,10 @@ public partial class Main : Node2D
 		};
 		_hoverTooltipLabel = new Label
 		{
-			CustomMinimumSize = new Vector2(160, 0),
+			CustomMinimumSize = new Vector2(240, 0),
 			AutowrapMode = TextServer.AutowrapMode.WordSmart,
 		};
-		_hoverTooltipLabel.AddThemeFontSizeOverride("font_size", 11);
+		_hoverTooltipLabel.AddThemeFontSizeOverride("font_size", 20);
 		_hoverTooltip.AddChild(_hoverTooltipLabel);
 		AddChild(_hoverTooltip); // world-space child, NOT on CanvasLayer
 
@@ -1433,15 +1524,25 @@ public partial class Main : Node2D
 
 	private void UpdateHudLayout()
 	{
-		if (_infoPanel == null || _actionsPanel == null) return;
+		if (_playerStatsPanel == null || _actionsPanel == null) return;
 
 		float vw = GetViewportRect().Size.X;
-		float infoW = _infoPanel.Size.X > 0f ? _infoPanel.Size.X : _infoPanel.CustomMinimumSize.X;
-		_infoPanel.Position = new Vector2(vw - infoW - 12f, 12f);
-
 		float vh = GetViewportRect().Size.Y;
+
+		// Top Left: Player Stats
+		_playerStatsPanel.Position = new Vector2(16f, 16f);
+
+		// Top Center: City Stats
+		float cityW = _cityStatsPanel.Size.X > 0f ? _cityStatsPanel.Size.X : _cityStatsPanel.CustomMinimumSize.X;
+		_cityStatsPanel.Position = new Vector2((vw - cityW) / 2f, 16f);
+
+		// Top Right: Clinic Stats
+		float clinicW = _clinicStatsPanel.Size.X > 0f ? _clinicStatsPanel.Size.X : _clinicStatsPanel.CustomMinimumSize.X;
+		_clinicStatsPanel.Position = new Vector2(vw - clinicW - 16f, 16f);
+
+		// Bottom Left: Actions Panel
 		float actH = _actionsPanel.Size.Y > 0f ? _actionsPanel.Size.Y : _actionsPanel.CustomMinimumSize.Y;
-		_actionsPanel.Position = new Vector2(12f, vh - actH - 12f);
+		_actionsPanel.Position = new Vector2(16f, vh - actH - 16f);
 	}
 
 	private void SetSelectedTool(BuildTool tool)
@@ -1470,10 +1571,13 @@ public partial class Main : Node2D
 	private void UpdateHud()
 	{
 		if (_dayLabel == null) return;
-		_dayLabel.Text = $"📅 Turn: {_day}";
-		_playerBudgetLabel.Text = $"💰 Budget: ${_playerBudget:0.0}";
-		_optimizerBudgetLabel.Text = $"🏙 City Budget: ${_citizenBudget:0.0}";
-		_previousProfitLabel.Text = $"📈 Last Profit: ${_previousDayProfit:0.0}";
+		_dayLabel.Text = $"📅 Turn {_day}";
+		_playerBudgetLabel.Text = $"💰 ${_playerBudget:0.0}";
+		_optimizerBudgetLabel.Text = $"${_citizenBudget:0.0}";
+		
+		string profitSign = _previousDayProfit >= 0 ? "+" : "";
+		_previousProfitLabel.Text = $"📈 {profitSign}${_previousDayProfit:0.0}";
+		_previousProfitLabel.AddThemeColorOverride("font_color", _previousDayProfit >= 0 ? new Color(0.6f, 1.0f, 0.6f) : new Color(1.0f, 0.6f, 0.6f));
 
 		// Coverage label — color by health
 		if (_coverageLabel != null)
@@ -1481,12 +1585,11 @@ public partial class Main : Node2D
 			// Will be set after receiving response
 		}
 
-		// Health bar
 		if (_clinicHealthBar != null && _clinicHealthBarBg != null)
 		{
 			float maxMoney = 120f;
 			float ratio = Mathf.Clamp(_clinicMoney / maxMoney, 0f, 1f);
-			_clinicHealthBar.Size = new Vector2(160f * ratio, 16f);
+			_clinicHealthBar.Size = new Vector2(280f * ratio, 20f);
 			_clinicHealthBar.Color = ratio > 0.5f
 				? new Color(0.2f, 0.8f, 0.3f)
 				: ratio > 0.25f

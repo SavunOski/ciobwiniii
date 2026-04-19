@@ -29,7 +29,7 @@ public partial class Main : Node2D
 
 	private const float RoadCost = 3f;
 	private const float MallCost = 5f;
-	private const float RoadDestroyCost = 2f;
+	private const float RoadDestroyCost = 10f;
 	private const float UpgradeCost = 2f;
 	private const float BlockageCost = 4f;
 	private const float CutFundingCost = 8f;
@@ -309,30 +309,111 @@ public partial class Main : Node2D
 		PlaceEntity(_clinicPos, new Color(0.85f, 0.65f, 0.1f), "⭐", "Clinic");
 		_occupiedTiles.Add(_clinicPos);
 
-		// Hospitals — kept away from clinic
-		PlaceRandomEntities(
-			rng,
-			count: HospitalCount,
-			minDist: 8f,
-			exclusions: new List<Vector2I> { _clinicPos },
-			col: new Color(0.75f, 0.18f, 0.18f),
-			emoji: "🏥",
-			prefix: "Hospital",
-			storeList: _hospitalPositions
-		);
+		// Hospitals — spread across diagonal corner sectors
+		PlaceHospitalsInSectors(rng);
 
-		// Houses — kept away from hospitals and clinic
-		var houseExclusions = new List<Vector2I>(_hospitalPositions) { _clinicPos };
-		PlaceRandomEntities(
-			rng,
-			count: HouseCount,
-			minDist: 3f,
-			exclusions: houseExclusions,
-			col: new Color(0.2f, 0.38f, 0.75f),
-			emoji: "🏠",
-			prefix: "House",
-			storeList: _housePositions
-		);
+		// Houses — guarantee at least 1 per hospital Voronoi region
+		PlaceHousesWithCoverage(rng);
+	}
+
+	private void PlaceHospitalsInSectors(RandomNumberGenerator rng)
+	{
+		// Four corner sectors far from center (GridSize=20, center=10)
+		var sectors = new (int x0, int y0, int x1, int y1)[]
+		{
+			(2, 2, 7, 7),           // NW
+			(13, 2, 18, 7),         // NE
+			(2, 13, 7, 18),         // SW
+			(13, 13, 18, 18),       // SE
+		};
+
+		// Choose a diagonal pair for maximum spread: NW+SE or NE+SW
+		int[] chosen = rng.Randf() > 0.5f ? new[] { 0, 3 } : new[] { 1, 2 };
+
+		for (int h = 0; h < HospitalCount && h < chosen.Length; h++)
+		{
+			var (x0, y0, x1, y1) = sectors[chosen[h]];
+			PlaceInRect(rng, x0, y0, x1, y1,
+				new Color(0.75f, 0.18f, 0.18f), "🏥", $"Hospital_{h}",
+				_hospitalPositions);
+		}
+	}
+
+	private void PlaceInRect(RandomNumberGenerator rng, int x0, int y0, int x1, int y1,
+		Color col, string emoji, string nodeName, List<Vector2I> storeList)
+	{
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			Vector2I pos = new(rng.RandiRange(x0, x1), rng.RandiRange(y0, y1));
+			if (_occupiedTiles.Contains(pos)) continue;
+			PlaceEntity(pos, col, emoji, nodeName);
+			_occupiedTiles.Add(pos);
+			storeList.Add(pos);
+			return;
+		}
+		GD.PrintErr($"PlaceInRect: could not place {nodeName} in ({x0},{y0})-({x1},{y1})");
+	}
+
+	private void PlaceHousesWithCoverage(RandomNumberGenerator rng)
+	{
+		var allExclusions = new List<Vector2I>(_hospitalPositions) { _clinicPos };
+		var hospitalCoverage = new int[_hospitalPositions.Count]; // # houses closer to each hospital than clinic
+
+		// ---- Random house placement ----
+		int placed = 0;
+		for (int attempt = 0; attempt < 3000 && placed < HouseCount; attempt++)
+		{
+			Vector2I pos = new(rng.RandiRange(2, GridSize - 3), rng.RandiRange(2, GridSize - 3));
+			if (_occupiedTiles.Contains(pos)) continue;
+			if (allExclusions.Exists(ex => Distance(pos, ex) < 3f)) continue;
+
+			int closest = ClosestHospitalIndex(pos);
+			PlaceEntity(pos, new Color(0.2f, 0.38f, 0.75f), "🏠", $"House_{placed}");
+			_occupiedTiles.Add(pos);
+			_housePositions.Add(pos);
+			if (closest >= 0 && Distance(pos, _hospitalPositions[closest]) < Distance(pos, _clinicPos))
+				hospitalCoverage[closest]++;
+			placed++;
+		}
+
+		// ---- Guarantee: force at least 1 house closer to each hospital ----
+		for (int h = 0; h < _hospitalPositions.Count; h++)
+		{
+			if (hospitalCoverage[h] > 0) continue;
+
+			Vector2I hosp = _hospitalPositions[h];
+			for (int attempt = 0; attempt < 1000; attempt++)
+			{
+				int dx = rng.RandiRange(-5, 5);
+				int dy = rng.RandiRange(-5, 5);
+				if (dx == 0 && dy == 0) continue;
+				Vector2I pos = new(
+					Mathf.Clamp(hosp.X + dx, 2, GridSize - 3),
+					Mathf.Clamp(hosp.Y + dy, 2, GridSize - 3));
+				if (_occupiedTiles.Contains(pos)) continue;
+				if (allExclusions.Exists(ex => Distance(pos, ex) < 2f)) continue;
+				if (Distance(pos, hosp) >= Distance(pos, _clinicPos)) continue; // must be closer to hospital
+
+				string nodeName = $"House_{_housePositions.Count}";
+				PlaceEntity(pos, new Color(0.2f, 0.38f, 0.75f), "🏠", nodeName);
+				_occupiedTiles.Add(pos);
+				_housePositions.Add(pos);
+				hospitalCoverage[h]++;
+				break;
+			}
+		}
+	}
+
+	private int ClosestHospitalIndex(Vector2I pos)
+	{
+		int best = -1;
+		float bestDist = float.MaxValue;
+		for (int i = 0; i < _hospitalPositions.Count; i++)
+		{
+			float d = Distance(pos, _hospitalPositions[i]);
+			if (d < bestDist) { bestDist = d; best = i; }
+		}
+		return best;
 	}
 
 	private void PlaceRandomEntities(
@@ -855,6 +936,7 @@ public partial class Main : Node2D
 		{
 			string houseId = $"House_{i}";
 			if (!preferredFacility.TryGetValue(houseId, out string facilityId)) continue;
+			if (string.IsNullOrEmpty(facilityId) || facilityId == "Disconnected") continue;
 
 			Vector2I houseGrid = _housePositions[i];
 			Vector2I facilityGrid;
@@ -863,11 +945,15 @@ public partial class Main : Node2D
 			{
 				facilityGrid = _clinicPos;
 			}
-			else
+			else if (facilityId.StartsWith("Hospital_"))
 			{
-				int hIdx = int.Parse(facilityId.Replace("Hospital_", ""));
+				if (!int.TryParse(facilityId.Replace("Hospital_", ""), out int hIdx)) continue;
 				if (hIdx < 0 || hIdx >= _hospitalPositions.Count) continue;
 				facilityGrid = _hospitalPositions[hIdx];
+			}
+			else
+			{
+				continue; // unknown facility
 			}
 
 			bool toClinic = facilityId == "Clinic";
@@ -1475,9 +1561,10 @@ public partial class Main : Node2D
 
 		if (CheckLoseCondition(clinicRatio)) return;
 
+		int destroyedRoads = ApplyDestroyedRoads(response?.destroyed_roads);
 		_statusLabel.Text =
-			$"Day {_day}: {clinicCount}/{_housePositions.Count} houses chose clinic ({clinicRatio * 100f:0.0}%). " +
-			$"Income: ${income:0.0} | Upkeep: ${upkeep:0.0} | City built {cityRoads} road(s).";
+			$"Day {_day}: {clinicCount}/{_housePositions.Count} chose clinic ({clinicRatio * 100f:0.0}%). " +
+			$"Income: ${income:0.0} | Upkeep: ${upkeep:0.0} | City built {cityRoads}, destroyed {destroyedRoads} road(s).";
 	}
 
 	private int ApplyRoadList(List<GridPoint> roads, bool isOptimizerRoad, bool animate)
@@ -1492,6 +1579,20 @@ public partial class Main : Node2D
 			applied++;
 		}
 		return applied;
+	}
+
+	private int ApplyDestroyedRoads(List<GridPoint> roads)
+	{
+		if (roads == null) return 0;
+		int count = 0;
+		foreach (var road in roads)
+		{
+			Vector2I pos = new(road.x, road.y);
+			if (!_structures.TryGetValue(pos, out var t) || t != BuildTool.Road) continue;
+			DestroyStructureAt(pos, animated: true);
+			count++;
+		}
+		return count;
 	}
 
 	private void UpdateFacilityPatientCounts(SolveResponse response)
@@ -1683,5 +1784,6 @@ public class SolveResponse
 	public float budget_seen { get; set; }
 	public float spent_budget { get; set; }
 	public List<GridPoint> built_roads { get; set; }
-	public List<GridPoint> optimizer_roads { get; set; }   // city-built roads
+	public List<GridPoint> optimizer_roads { get; set; }
+	public List<GridPoint> destroyed_roads { get; set; }  // city-destroyed roads (after turn 5)
 }

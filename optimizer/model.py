@@ -61,8 +61,11 @@ def solve_turn(data: dict) -> dict:
     # -----------------------------------------------------------------------
     # Build the set of WALKABLE tiles:
     #   - All road tiles (that aren't blocked)
-    #   - Tiles directly adjacent to any building (connector tiles)
-    #   - Building tiles themselves (endpoints)
+    #   - Building tiles themselves (endpoints, always walkable)
+    #   - Connector tiles (tiles directly adjacent to a building) ONLY when
+    #     they are also adjacent to at least one actual road tile.
+    #     This prevents isolated buildings (no roads) from being reachable
+    #     through pure connector-zone adjacency chains across empty grass.
     # -----------------------------------------------------------------------
     building_connectors: set[tuple[int, int]] = set()
     for pos in occupied:
@@ -73,10 +76,22 @@ def solve_turn(data: dict) -> dict:
             if 0 <= nxt[0] < grid_size and 0 <= nxt[1] < grid_size:
                 building_connectors.add(nxt)
 
-    walkable = set(building_connectors)
-    for road in existing_roads:
-        if road not in blocked_roads:
-            walkable.add(road)
+    # Step 1: start walkable from actual road tiles + building tiles (endpoints)
+    road_tiles: set[tuple[int, int]] = {
+        r for r in existing_roads if r not in blocked_roads
+    }
+    walkable: set[tuple[int, int]] = road_tiles | occupied
+
+    # Step 2: admit connector tiles only when they touch a real road
+    for tile in building_connectors:
+        if tile in walkable:
+            continue  # already included
+        tx, ty = tile
+        for dx, dy in CARDINAL_STEPS:
+            adj = (tx + dx, ty + dy)
+            if adj in road_tiles:
+                walkable.add(tile)
+                break
 
     def make_cost_fn(clinic_patient_count=0):
         clinic_adj = set()
@@ -461,19 +476,33 @@ def city_optimizer(
     if not target_houses:
         return []
 
-    # For each target house, BFS to nearest hospital through the grid.
+    # For each target house, BFS to nearest facility through the grid.
     # Record which tiles on that path are NOT currently roads.
     # BFS treats all tiles as walkable for planning (city CAN build there).
+    #
+    # Disconnected houses consider ALL facilities (hospitals AND clinic) so
+    # the optimizer always finds the cheapest reconnection regardless of which
+    # facility is nearest.  Clinic-preferring houses still only target hospitals
+    # (their goal is to be redirected away from the clinic).
     house_paths: dict[str, list[tuple[int, int]]] = {}
 
     for house in target_houses:
         hid = house["id"]
         hpos = (house["x"], house["y"])
+        pref = preferred_facility.get(hid)
         best_path = None
 
-        for hospital in hospitals:
-            hosp_pos = (hospital["x"], hospital["y"])
-            path = bfs_any_path(hpos, hosp_pos, occupied, grid_size)
+        # Disconnected houses -> try every facility (hospitals + clinic).
+        # Clinic-preferring houses -> only try hospitals (redirect goal).
+        if pref is None:
+            clinic_entry = [{"x": clinic_pos[0], "y": clinic_pos[1], "id": "Clinic"}] if clinic_pos else []
+            facility_targets = hospitals + clinic_entry
+        else:
+            facility_targets = hospitals
+
+        for fac in facility_targets:
+            fac_pos = (fac["x"], fac["y"])
+            path = bfs_any_path(hpos, fac_pos, occupied, grid_size)
             if path is None:
                 continue
             new_tiles = [t for t in path if t not in all_roads and t not in occupied]
